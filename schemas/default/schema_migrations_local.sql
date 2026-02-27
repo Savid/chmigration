@@ -1,0 +1,1 @@
+CREATE TABLE default.schema_migrations_local\n(\n    `version` Int64,\n    `dirty` UInt8,\n    `sequence` UInt64\n)\nENGINE = ReplicatedMergeTree(\'/clickhouse/{installation}/{cluster}/tables/{shard}/default/schema_migrations_local\', \'{replica}\')\nORDER BY sequence\nSETTINGS index_granularity = 81921\n

@@ -1,0 +1,1 @@
+CREATE TABLE default.imported_sources\n(\n    `create_date_time` DateTime64(3) CODEC(DoubleDelta, ZSTD(1)),\n    `target_date_time` DateTime CODEC(DoubleDelta, ZSTD(1)),\n    `source` LowCardinality(String)\n)\nENGINE = Distributed(\'{cluster}\', \'default\', \'imported_sources_local\', rand())\n

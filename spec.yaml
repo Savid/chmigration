@@ -1,0 +1,228 @@
+version: 1
+
+databases:
+  order:
+    - default
+    - observoor
+    - admin
+  create_if_missing:
+    - observoor
+    - admin
+
+exclude_objects:
+  - default.schema_migrations
+  - default.schema_migrations_local
+
+engine:
+  replicated_path_template: "/clickhouse/{installation}/{cluster}/tables/{shard}/{database}/{table}"
+  local:
+    plain_merge_tree_tables:
+      - default.beacon_api_slot_local
+      - default.imported_sources_local
+      - observoor.raw_events_local
+
+columns:
+  remove_globally:
+    - meta_client_id
+    - meta_network_id
+    - meta_labels
+  remove_by_table:
+    default.beacon_api_eth_v1_events_data_column_sidecar:
+      - kzg_commitments
+    default.beacon_api_eth_v1_events_data_column_sidecar_local:
+      - kzg_commitments
+    default.libp2p_gossipsub_aggregate_and_proof:
+      - version
+    default.libp2p_gossipsub_aggregate_and_proof_local:
+      - version
+    default.libp2p_gossipsub_beacon_attestation:
+      - version
+    default.libp2p_gossipsub_beacon_attestation_local:
+      - version
+    default.libp2p_gossipsub_beacon_block:
+      - version
+    default.libp2p_gossipsub_beacon_block_local:
+      - version
+    default.libp2p_gossipsub_blob_sidecar:
+      - version
+    default.libp2p_gossipsub_blob_sidecar_local:
+      - version
+    default.libp2p_gossipsub_data_column_sidecar:
+      - version
+    default.libp2p_gossipsub_data_column_sidecar_local:
+      - version
+    default.canonical_beacon_validators_pubkeys:
+      - version
+    default.canonical_beacon_validators_pubkeys_local:
+      - version
+    default.canonical_beacon_validators_withdrawal_credentials:
+      - version
+    default.canonical_beacon_validators_withdrawal_credentials_local:
+      - version
+  remove_sampling_columns:
+    database: observoor
+    columns:
+      - sampling_mode
+      - sampling_rate
+    except_tables:
+      - host_specs
+      - host_specs_local
+      - raw_events
+      - raw_events_local
+      - sync_state
+      - sync_state_local
+  add_or_replace:
+    updated_date_time:
+      "default.beacon_api_eth_v1_beacon_blob": "DateTime COMMENT 'When this row was last updated' CODEC(DoubleDelta, ZSTD(1))"
+      "default.beacon_api_eth_v1_beacon_blob_local": "DateTime COMMENT 'When this row was last updated' CODEC(DoubleDelta, ZSTD(1))"
+      "default.beacon_api_eth_v1_events_attestation": "DateTime COMMENT 'When this row was last updated' CODEC(DoubleDelta, ZSTD(1))"
+      "default.beacon_api_eth_v1_events_attestation_local": "DateTime COMMENT 'When this row was last updated' CODEC(DoubleDelta, ZSTD(1))"
+  renames:
+    default.canonical_execution_erc721_transfers:
+      erc20: erc721
+    default.canonical_execution_erc721_transfers_local:
+      erc20: erc721
+  definition_overrides:
+    default.beacon_api_eth_v1_events_chain_reorg_local:
+      event_date_time: DateTime64(3) CODEC(DoubleDelta, ZSTD(1))
+    default.beacon_api_eth_v1_events_contribution_and_proof_local:
+      event_date_time: DateTime64(3) CODEC(DoubleDelta, ZSTD(1))
+    default.beacon_api_eth_v1_events_head_local:
+      event_date_time: DateTime64(3) CODEC(DoubleDelta, ZSTD(1))
+    default.beacon_api_eth_v1_events_voluntary_exit_local:
+      event_date_time: DateTime64(3) CODEC(DoubleDelta, ZSTD(1))
+    default.beacon_api_eth_v1_validator_attestation_data_local:
+      event_date_time: DateTime64(3) CODEC(DoubleDelta, ZSTD(1))
+    default.beacon_api_eth_v2_beacon_block_local:
+      event_date_time: DateTime64(3) CODEC(DoubleDelta, ZSTD(1))
+    default.beacon_api_eth_v3_validator_block_local:
+      slot_start_date_time: DateTime CODEC(DoubleDelta, ZSTD(1))
+    default.consensus_engine_api_new_payload_local:
+      meta_execution_version: LowCardinality(String)
+
+types:
+  overrides:
+    default.beacon_api_eth_v2_beacon_block:
+      execution_payload_block_hash: Nullable(FixedString(66))
+      execution_payload_block_number: Nullable(UInt32)
+      execution_payload_fee_recipient: Nullable(String)
+    default.beacon_api_eth_v2_beacon_block_local:
+      execution_payload_block_hash: Nullable(FixedString(66))
+      execution_payload_block_number: Nullable(UInt32)
+      execution_payload_fee_recipient: Nullable(String)
+    default.canonical_execution_contracts:
+      block_number: UInt64
+    default.canonical_execution_contracts_local:
+      block_number: UInt64
+    default.canonical_execution_logs:
+      block_number: UInt64
+      transaction_index: UInt64
+    default.canonical_execution_logs_local:
+      block_number: UInt64
+      transaction_index: UInt64
+    default.canonical_execution_storage_diffs:
+      block_number: UInt64
+      transaction_index: UInt64
+    default.canonical_execution_storage_diffs_local:
+      block_number: UInt64
+      transaction_index: UInt64
+    default.canonical_execution_storage_reads:
+      block_number: UInt64
+      transaction_index: UInt64
+    default.canonical_execution_storage_reads_local:
+      block_number: UInt64
+      transaction_index: UInt64
+    default.canonical_execution_traces:
+      block_number: UInt64
+      transaction_index: UInt64
+      action_gas: UInt64
+      action_value: UInt256
+      result_gas_used: UInt64
+    default.canonical_execution_traces_local:
+      block_number: UInt64
+      transaction_index: UInt64
+      action_gas: UInt64
+      action_value: UInt256
+      result_gas_used: UInt64
+    default.canonical_execution_transaction:
+      gas_price: UInt128
+      transaction_type: UInt8
+    default.canonical_execution_transaction_local:
+      gas_price: UInt128
+      transaction_type: UInt8
+    default.canonical_execution_transaction_structlog:
+      transaction_index: UInt64
+    default.canonical_execution_transaction_structlog_local:
+      transaction_index: UInt64
+    default.canonical_execution_transaction_structlog_agg:
+      transaction_index: UInt64
+    default.canonical_execution_transaction_structlog_agg_local:
+      transaction_index: UInt64
+    default.execution_engine_get_blobs:
+      duration_ms: UInt64
+    default.execution_engine_get_blobs_local:
+      duration_ms: UInt64
+    default.execution_engine_new_payload:
+      duration_ms: UInt64
+    default.execution_engine_new_payload_local:
+      duration_ms: UInt64
+    default.libp2p_connected:
+      remote_port: Nullable(UInt16)
+    default.libp2p_connected_local:
+      remote_port: Nullable(UInt16)
+    default.libp2p_disconnected:
+      remote_port: Nullable(UInt16)
+    default.libp2p_disconnected_local:
+      remote_port: Nullable(UInt16)
+    default.libp2p_handle_metadata:
+      direction: LowCardinality(String)
+    default.libp2p_handle_metadata_local:
+      direction: LowCardinality(String)
+    default.libp2p_handle_status:
+      direction: LowCardinality(String)
+    default.libp2p_handle_status_local:
+      direction: LowCardinality(String)
+    default.node_record_consensus:
+      node_id: String
+    default.node_record_consensus_local:
+      node_id: String
+
+local_rules:
+  partition:
+    overrides:
+      default.imported_sources_local: toStartOfMonth(create_date_time)
+      default.block_native_mempool_transaction_local: (network, toYYYYMM(detecttime))
+      default.mempool_dumpster_transaction_local: (chain_id, toYYYYMM(timestamp))
+      admin.cryo_local: meta_network_name
+      admin.execution_block_local: meta_network_name
+  order:
+    keep_original_order_tables:
+      - admin.cryo_local
+      - admin.execution_block_local
+      - default.imported_sources_local
+      - default.libp2p_peer_local
+    first_key_overrides:
+      default.block_native_mempool_transaction_local: network
+      default.mempool_dumpster_transaction_local: chain_id
+
+distributed_rules:
+  shard_key:
+    reference_sql: migration.sql
+    rand_tables:
+      - default.imported_sources
+      - observoor.raw_events
+    overrides:
+      default.beacon_api_eth_v1_beacon_blob: cityHash64(slot_start_date_time, meta_client_name, block_root)
+      default.beacon_api_eth_v1_events_attestation: cityHash64(slot_start_date_time, meta_client_name)
+      default.beacon_api_slot: cityHash64(slot_start_date_time, slot)
+      default.libp2p_peer: unique_key
+
+comments:
+  distributed_fallback_to_local: true
+
+rendering:
+  header_comment: |
+    -- Migration 102: Schema V2 (GENERATED)
+    --
+    -- Source: schemas + spec.yaml
+    -- This file is generated by generate_migration.py.

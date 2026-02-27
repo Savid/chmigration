@@ -1,0 +1,1 @@
+CREATE TABLE default.libp2p_peer\n(\n    `unique_key` Int64,\n    `updated_date_time` DateTime CODEC(DoubleDelta, ZSTD(1)),\n    `peer_id` String CODEC(ZSTD(1)),\n    `meta_network_id` Int32 CODEC(DoubleDelta, ZSTD(1)),\n    `meta_network_name` LowCardinality(String)\n)\nENGINE = Distributed(\'{cluster}\', \'default\', \'libp2p_peer_local\', unique_key)\n
