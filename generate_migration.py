@@ -967,12 +967,6 @@ def generate_markdown(old: dict[str, SQLObject], new: dict[str, SQLObject], spec
             f"- `version` removed from {len(removed_version_tables)} tables "
             "(`libp2p_gossipsub_*` and canonical beacon validator version-column tables)."
         )
-    if remove_counts.get("sampling_mode", 0) > 0:
-        lines.append(
-            f"- `sampling_mode` + `sampling_rate` removed from {remove_counts.get('sampling_mode', 0)} observoor tables."
-        )
-    if remove_counts.get("kzg_commitments", 0) > 0:
-        lines.append(f"- `kzg_commitments` removed from {remove_counts.get('kzg_commitments', 0)} tables.")
     if added_counts.get("erc721", 0) > 0:
         lines.append(f"- `erc20 -> erc721` rename applied in {added_counts.get('erc721', 0)} tables.")
     lines.append("")

@@ -179,6 +179,19 @@ class TestGenerateMigration(unittest.TestCase):
             definition = self._normalize_column_definition(gen_cols[column])
             self.assertNotIn("DEFAULT ''", definition, f"{table}.{column}")
 
+    def test_sampling_columns_are_retained_for_observoor_tables(self) -> None:
+        sql, _, _, _ = generate_outputs(SCHEMAS_DIR, SPEC_PATH)
+        table = "observoor.process_exit_local"
+        gen_cols = self._extract_table_columns(sql, table)
+        self.assertIn("sampling_mode", gen_cols, table)
+        self.assertIn("sampling_rate", gen_cols, table)
+
+    def test_kzg_commitments_column_is_retained(self) -> None:
+        sql, _, _, _ = generate_outputs(SCHEMAS_DIR, SPEC_PATH)
+        table = "default.beacon_api_eth_v1_events_data_column_sidecar_local"
+        gen_cols = self._extract_table_columns(sql, table)
+        self.assertIn("kzg_commitments", gen_cols, table)
+
     def test_distributed_comment_falls_back_to_local_comment(self) -> None:
         sql, _, _, _ = generate_outputs(SCHEMAS_DIR, SPEC_PATH)
         local_table = "default.beacon_api_eth_v1_beacon_committee_local"
