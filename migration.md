@@ -17,8 +17,6 @@ Migration 102 (`102_schema_v2.up.sql`) is generated from `schemas/` and `spec.ya
 Additional removals and renames:
 
 - `version` removed from 14 tables (`libp2p_gossipsub_*` and canonical beacon validator version-column tables).
-- `sampling_mode` + `sampling_rate` removed from 70 observoor tables.
-- `kzg_commitments` removed from 2 tables.
 - `erc20 -> erc721` rename applied in 2 tables.
 
 ## Engine configuration

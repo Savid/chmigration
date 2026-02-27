@@ -27,10 +27,6 @@ columns:
     - meta_network_id
     - meta_labels
   remove_by_table:
-    default.beacon_api_eth_v1_events_data_column_sidecar:
-      - kzg_commitments
-    default.beacon_api_eth_v1_events_data_column_sidecar_local:
-      - kzg_commitments
     default.libp2p_gossipsub_aggregate_and_proof:
       - version
     default.libp2p_gossipsub_aggregate_and_proof_local:
@@ -59,18 +55,6 @@ columns:
       - version
     default.canonical_beacon_validators_withdrawal_credentials_local:
       - version
-  remove_sampling_columns:
-    database: observoor
-    columns:
-      - sampling_mode
-      - sampling_rate
-    except_tables:
-      - host_specs
-      - host_specs_local
-      - raw_events
-      - raw_events_local
-      - sync_state
-      - sync_state_local
   add_or_replace:
     updated_date_time:
       "default.beacon_api_eth_v1_beacon_blob": "DateTime COMMENT 'When this row was last updated' CODEC(DoubleDelta, ZSTD(1))"
