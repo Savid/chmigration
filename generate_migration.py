@@ -168,9 +168,50 @@ def apply_manual_table_comment_fallback(obj: SQLObject) -> None:
         obj.comment = fallback
 
 
+def normalize_transport_escaped_literals(text: str) -> str:
+    """Convert transport literals (\\'...\\') into SQL string literals ('...')."""
+
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if i + 1 < n and text[i] == "\\" and text[i + 1] == "'":
+            i += 2
+            chars: list[str] = []
+            while i < n:
+                if i + 1 < n and text[i] == "\\" and text[i + 1] == "\\":
+                    chars.append("\\")
+                    i += 2
+                    continue
+
+                if i + 1 < n and text[i] == "\\" and text[i + 1] == "'":
+                    nxt = text[i + 2] if i + 2 < n else ""
+                    # In transport format, an escaped apostrophe inside content is often
+                    # followed by an identifier character (e.g. node\'s).
+                    if nxt and (nxt.isalnum() or nxt == "_"):
+                        chars.append("'")
+                        i += 2
+                        continue
+                    i += 2
+                    break
+
+                chars.append(text[i])
+                i += 1
+
+            literal = "".join(chars).replace("'", "''")
+            out.append(f"'{literal}'")
+            continue
+
+        out.append(text[i])
+        i += 1
+
+    return "".join(out)
+
+
 def decode_schema_sql(raw: str) -> str:
     """Schema dumps are stored as one line with escaped newlines."""
     text = raw.replace("\\r\\n", "\\n").replace("\\n", "\n")
+    text = normalize_transport_escaped_literals(text)
     return text.strip() + "\n"
 
 
@@ -274,7 +315,11 @@ def normalize_comment_literal(expr: str) -> str:
     expr = expr.strip().rstrip(";").strip()
     if expr.startswith("\\'") and expr.endswith("\\'") and len(expr) >= 4:
         inner = expr[2:-2].replace("\\\\", "\\").replace("\\'", "'")
-        escaped = inner.replace("\\", "\\\\").replace("'", "\\'")
+        escaped = inner.replace("\\", "\\\\").replace("'", "''")
+        return f"'{escaped}'"
+    if expr.startswith("'") and expr.endswith("'") and len(expr) >= 2:
+        inner = expr[1:-1].replace("\\\\", "\\").replace("\\'", "'").replace("''", "'")
+        escaped = inner.replace("\\", "\\\\").replace("'", "''")
         return f"'{escaped}'"
     return expr
 
@@ -287,16 +332,80 @@ def extract_last_table_comment(text: str) -> str | None:
 
 
 def parse_columns_block(block: str) -> list[Column]:
+    def split_columns(text: str) -> list[str]:
+        parts: list[str] = []
+        buf: list[str] = []
+        depth = 0
+        in_single = False
+        in_backtick = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+
+            if in_backtick:
+                buf.append(ch)
+                if ch == "`":
+                    in_backtick = False
+                i += 1
+                continue
+
+            if in_single:
+                buf.append(ch)
+                if ch == "'":
+                    # SQL escaped quote inside literal: ''
+                    if i + 1 < len(text) and text[i + 1] == "'":
+                        buf.append(text[i + 1])
+                        i += 2
+                        continue
+                    in_single = False
+                i += 1
+                continue
+
+            if ch == "`":
+                in_backtick = True
+                buf.append(ch)
+                i += 1
+                continue
+
+            if ch == "'":
+                in_single = True
+                buf.append(ch)
+                i += 1
+                continue
+
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+
+            if ch == "," and depth == 0:
+                token = "".join(buf).strip()
+                if token:
+                    parts.append(token)
+                buf = []
+                i += 1
+                continue
+
+            buf.append(ch)
+            i += 1
+
+        token = "".join(buf).strip()
+        if token:
+            parts.append(token)
+        return parts
+
     columns: list[Column] = []
-    for raw_line in block.splitlines():
-        line = raw_line.strip().rstrip(",")
-        if not line:
+    for raw_col in split_columns(block):
+        col_text = raw_col.strip()
+        if not col_text:
             continue
-        m = re.match(r"^`([^`]+)`\s+(.+)$", line)
+        m = re.match(r"^`([^`]+)`\s+(.+)$", col_text, flags=re.S)
         if not m:
             continue
         name = m.group(1)
-        col_type, suffix = split_type_suffix(m.group(2))
+        col_type, suffix = split_type_suffix(" ".join(m.group(2).split()))
+        if suffix:
+            suffix = normalize_transport_escaped_literals(suffix)
         columns.append(Column(name=name, col_type=col_type, suffix=suffix))
     return columns
 
