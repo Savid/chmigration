@@ -27,6 +27,10 @@ htmlcov/
 *.swo
 *~
 
+# Backup artifacts
+backup/state.jsonl
+backup/__pycache__/
+
 # OS files
 .DS_Store
 Thumbs.db
