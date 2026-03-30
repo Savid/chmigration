@@ -1388,30 +1388,30 @@ COMMENT 'Contains a validator state for an epoch.';
 
 CREATE TABLE IF NOT EXISTS default.canonical_beacon_validators_pubkeys_local ON CLUSTER '{cluster}'
 (
-    `updated_date_time` DateTime CODEC(DoubleDelta, ZSTD(1)),
-    `epoch` UInt32 CODEC(DoubleDelta, ZSTD(1)),
-    `epoch_start_date_time` DateTime CODEC(DoubleDelta, ZSTD(1)),
-    `index` UInt32 CODEC(ZSTD(1)),
-    `pubkey` String CODEC(ZSTD(1)),
-    `meta_client_name` LowCardinality(String),
-    `meta_client_version` LowCardinality(String),
-    `meta_client_implementation` LowCardinality(String),
-    `meta_client_os` LowCardinality(String),
-    `meta_client_ip` Nullable(IPv6) CODEC(ZSTD(1)),
-    `meta_client_geo_city` LowCardinality(String) CODEC(ZSTD(1)),
-    `meta_client_geo_country` LowCardinality(String) CODEC(ZSTD(1)),
-    `meta_client_geo_country_code` LowCardinality(String) CODEC(ZSTD(1)),
-    `meta_client_geo_continent_code` LowCardinality(String) CODEC(ZSTD(1)),
-    `meta_client_geo_longitude` Nullable(Float64) CODEC(ZSTD(1)),
-    `meta_client_geo_latitude` Nullable(Float64) CODEC(ZSTD(1)),
-    `meta_client_geo_autonomous_system_number` Nullable(UInt32) CODEC(ZSTD(1)),
-    `meta_client_geo_autonomous_system_organization` Nullable(String) CODEC(ZSTD(1)),
-    `meta_network_name` LowCardinality(String),
-    `meta_consensus_version` LowCardinality(String),
-    `meta_consensus_version_major` LowCardinality(String),
-    `meta_consensus_version_minor` LowCardinality(String),
-    `meta_consensus_version_patch` LowCardinality(String),
-    `meta_consensus_implementation` LowCardinality(String)
+    `updated_date_time` DateTime COMMENT 'When this row was last updated' CODEC(DoubleDelta, ZSTD(1)),
+    `epoch` UInt32 COMMENT 'The epoch number from beacon block payload' CODEC(DoubleDelta, ZSTD(1)),
+    `epoch_start_date_time` DateTime COMMENT 'The wall clock time when the epoch started' CODEC(DoubleDelta, ZSTD(1)),
+    `index` UInt32 COMMENT 'The index of the validator' CODEC(ZSTD(1)),
+    `pubkey` String COMMENT 'The public key of the validator' CODEC(ZSTD(1)),
+    `meta_client_name` LowCardinality(String) COMMENT 'Name of the client that generated the event',
+    `meta_client_version` LowCardinality(String) COMMENT 'Version of the client that generated the event',
+    `meta_client_implementation` LowCardinality(String) COMMENT 'Implementation of the client that generated the event',
+    `meta_client_os` LowCardinality(String) COMMENT 'Operating system of the client that generated the event',
+    `meta_client_ip` Nullable(IPv6) COMMENT 'IP address of the client that generated the event' CODEC(ZSTD(1)),
+    `meta_client_geo_city` LowCardinality(String) COMMENT 'City of the client that generated the event' CODEC(ZSTD(1)),
+    `meta_client_geo_country` LowCardinality(String) COMMENT 'Country of the client that generated the event' CODEC(ZSTD(1)),
+    `meta_client_geo_country_code` LowCardinality(String) COMMENT 'Country code of the client that generated the event' CODEC(ZSTD(1)),
+    `meta_client_geo_continent_code` LowCardinality(String) COMMENT 'Continent code of the client that generated the event' CODEC(ZSTD(1)),
+    `meta_client_geo_longitude` Nullable(Float64) COMMENT 'Longitude of the client that generated the event' CODEC(ZSTD(1)),
+    `meta_client_geo_latitude` Nullable(Float64) COMMENT 'Latitude of the client that generated the event' CODEC(ZSTD(1)),
+    `meta_client_geo_autonomous_system_number` Nullable(UInt32) COMMENT 'Autonomous system number of the client that generated the event' CODEC(ZSTD(1)),
+    `meta_client_geo_autonomous_system_organization` Nullable(String) COMMENT 'Autonomous system organization of the client that generated the event' CODEC(ZSTD(1)),
+    `meta_network_name` LowCardinality(String) COMMENT 'Ethereum network name',
+    `meta_consensus_version` LowCardinality(String) COMMENT 'Ethereum consensus client version that generated the event',
+    `meta_consensus_version_major` LowCardinality(String) COMMENT 'Ethereum consensus client major version that generated the event',
+    `meta_consensus_version_minor` LowCardinality(String) COMMENT 'Ethereum consensus client minor version that generated the event',
+    `meta_consensus_version_patch` LowCardinality(String) COMMENT 'Ethereum consensus client patch version that generated the event',
+    `meta_consensus_implementation` LowCardinality(String) COMMENT 'Ethereum consensus client implementation that generated the event'
 )
 ENGINE = ReplicatedReplacingMergeTree('/clickhouse/{installation}/{cluster}/tables/{shard}/{database}/{table}', '{replica}', updated_date_time)
 PARTITION BY meta_network_name
@@ -1447,8 +1447,7 @@ CREATE TABLE IF NOT EXISTS default.canonical_beacon_validators_withdrawal_creden
 )
 ENGINE = ReplicatedReplacingMergeTree('/clickhouse/{installation}/{cluster}/tables/{shard}/{database}/{table}', '{replica}', updated_date_time)
 PARTITION BY meta_network_name
-ORDER BY (meta_network_name, index, withdrawal_credentials)
-COMMENT 'Contains a validator state for an epoch.';
+ORDER BY (meta_network_name, index, withdrawal_credentials);
 
 CREATE TABLE IF NOT EXISTS default.canonical_execution_address_appearances_local ON CLUSTER '{cluster}'
 (
@@ -2818,7 +2817,7 @@ CREATE TABLE IF NOT EXISTS default.libp2p_peer_local ON CLUSTER '{cluster}'
 ENGINE = ReplicatedReplacingMergeTree('/clickhouse/{installation}/{cluster}/tables/{shard}/{database}/{table}', '{replica}', updated_date_time)
 PARTITION BY meta_network_name
 ORDER BY unique_key
-COMMENT 'Lookup table mapping seahashed peer_id + network to original peer ID. Collected from deep instrumentation within forked consensus layer clients. Partition: monthly by `event_date_time`';
+COMMENT 'Contains the original peer id of a seahashed peer_id + meta_network_name, commonly seen in other tables as the field peer_id_unique_key';
 
 CREATE TABLE IF NOT EXISTS default.libp2p_prune_local ON CLUSTER '{cluster}'
 (
@@ -3126,7 +3125,7 @@ CREATE TABLE IF NOT EXISTS default.libp2p_rpc_meta_control_iwant_local ON CLUSTE
 ENGINE = ReplicatedReplacingMergeTree('/clickhouse/{installation}/{cluster}/tables/{shard}/{database}/{table}', '{replica}', updated_date_time)
 PARTITION BY (meta_network_name, toYYYYMM(event_date_time))
 ORDER BY (meta_network_name, event_date_time, unique_key, control_index, message_index, meta_client_name)
-COMMENT 'Contains the details of the "I want" control messages from the peer.';
+COMMENT 'Contains IWANT control messages from gossipsub. Collected from deep instrumentation within forked consensus layer clients. Peers request specific message IDs. Partition: monthly by `event_date_time`';
 
 CREATE TABLE IF NOT EXISTS default.libp2p_rpc_meta_control_prune_local ON CLUSTER '{cluster}'
 (
@@ -4250,7 +4249,7 @@ CREATE TABLE IF NOT EXISTS observoor.sync_state_local ON CLUSTER '{cluster}'
 ENGINE = ReplicatedReplacingMergeTree('/clickhouse/{installation}/{cluster}/tables/{shard}/{database}/{table}', '{replica}', updated_date_time)
 PARTITION BY (meta_network_name, toYYYYMM(event_time))
 ORDER BY (meta_network_name, event_time, meta_client_name)
-COMMENT 'Sync state snapshots for consensus and execution layers.';
+COMMENT 'Sync state snapshots for consensus and execution layers';
 
 CREATE TABLE IF NOT EXISTS observoor.syscall_epoll_wait_local ON CLUSTER '{cluster}'
 (
@@ -4976,7 +4975,7 @@ COMMENT 'Contains the details of the LEAVE events from the libp2p client.';
 CREATE TABLE IF NOT EXISTS default.libp2p_peer ON CLUSTER '{cluster}'
 AS default.libp2p_peer_local
 ENGINE = Distributed('{cluster}', 'default', 'libp2p_peer_local', unique_key)
-COMMENT 'Lookup table mapping seahashed peer_id + network to original peer ID. Collected from deep instrumentation within forked consensus layer clients. Partition: monthly by `event_date_time`';
+COMMENT 'Contains the original peer id of a seahashed peer_id + meta_network_name, commonly seen in other tables as the field peer_id_unique_key';
 
 CREATE TABLE IF NOT EXISTS default.libp2p_prune ON CLUSTER '{cluster}'
 AS default.libp2p_prune_local
@@ -5026,7 +5025,7 @@ COMMENT 'Contains the details of the "I have" control messages from the peer.';
 CREATE TABLE IF NOT EXISTS default.libp2p_rpc_meta_control_iwant ON CLUSTER '{cluster}'
 AS default.libp2p_rpc_meta_control_iwant_local
 ENGINE = Distributed('{cluster}', 'default', 'libp2p_rpc_meta_control_iwant_local', unique_key)
-COMMENT 'Contains the details of the "I want" control messages from the peer.';
+COMMENT 'Contains IWANT control messages from gossipsub. Collected from deep instrumentation within forked consensus layer clients. Peers request specific message IDs. Partition: monthly by `event_date_time`';
 
 CREATE TABLE IF NOT EXISTS default.libp2p_rpc_meta_control_prune ON CLUSTER '{cluster}'
 AS default.libp2p_rpc_meta_control_prune_local
@@ -5218,7 +5217,7 @@ COMMENT 'Aggregated swap-out metrics from eBPF tracing of Ethereum client proces
 CREATE TABLE IF NOT EXISTS observoor.sync_state ON CLUSTER '{cluster}'
 AS observoor.sync_state_local
 ENGINE = Distributed('{cluster}', 'observoor', 'sync_state_local', cityHash64(event_time, meta_network_name, meta_client_name))
-COMMENT 'Sync state snapshots for consensus and execution layers.';
+COMMENT 'Sync state snapshots for consensus and execution layers';
 
 CREATE TABLE IF NOT EXISTS observoor.syscall_epoll_wait ON CLUSTER '{cluster}'
 AS observoor.syscall_epoll_wait_local

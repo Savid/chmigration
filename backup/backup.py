@@ -307,6 +307,9 @@ def format_size(b: int) -> str:
 # Per-table backup logic
 # ---------------------------------------------------------------------------
 
+POLL_INTERVAL = 10  # seconds between async backup status checks
+
+
 def do_backup_partition(
     host: str,
     port: int,
@@ -315,10 +318,13 @@ def do_backup_partition(
     partition: str,
     disk: str,
     cluster: str | None,
-    timeout: int,
     backup_path: str,
-) -> None:
-    """Issue a BACKUP TABLE ... PARTITIONS ... TO Disk(...) command."""
+) -> tuple[str, dict | None]:
+    """Issue an ASYNC BACKUP and poll until completion.
+
+    Returns (status, info_dict) where status is 'BACKUP_CREATED' or
+    'BACKUP_FAILED'.
+    """
     cluster_clause = f" ON CLUSTER '{cluster}'" if cluster else ""
     partition_expr = format_partition_expr(partition)
 
@@ -327,9 +333,20 @@ def do_backup_partition(
         f" PARTITIONS {partition_expr}"
         f"{cluster_clause}"
         f" TO Disk('{disk}', '{backup_path}')"
-        f" SETTINGS allow_backup_broken_projections = 1"
+        f" ASYNC"
     )
-    query(host, port, sql, timeout=timeout)
+    query(host, port, sql, timeout=60)
+
+    # Poll until done.
+    while not _shutdown:
+        time.sleep(POLL_INTERVAL)
+        status, info = check_backup_status(host, port, backup_path, cluster)
+        if status is None:
+            continue
+        if status != "CREATING_BACKUP":
+            return status, info
+
+    return "INTERRUPTED", None
 
 
 def backup_table(
@@ -340,7 +357,6 @@ def backup_table(
     cutoff: datetime | None,
     disk: str,
     cluster: str | None,
-    timeout: int,
     log: Callable[[str], None] = print,
     on_partition_done: Callable[[], None] | None = None,
     on_bytes_created: Callable[[int], None] | None = None,
@@ -387,8 +403,27 @@ def backup_table(
             continue
 
         if status == "CREATING_BACKUP":
-            results["in_progress"] += 1
-            partition_outcomes[partition_id] = "in_progress"
+            # Previous run's backup is still going — wait for it.
+            log(f"  Waiting for in-progress backup of {partition}...")
+            while not _shutdown:
+                time.sleep(POLL_INTERVAL)
+                status, info = check_backup_status(host, port, path, cluster)
+                if status != "CREATING_BACKUP":
+                    break
+            if _shutdown:
+                break
+            if status == "BACKUP_CREATED":
+                backed_bytes = int(info.get("total_size", 0)) if info else 0
+                log(f"  {partition} completed -> {format_size(backed_bytes)}")
+                results["created"] += 1
+                partition_outcomes[partition_id] = "created"
+                if on_bytes_created:
+                    on_bytes_created(backed_bytes)
+            else:
+                err = info.get("error", "unknown") if info else "unknown"
+                log(f"  {partition} FAILED after wait: {err}")
+                results["failed"] += 1
+                partition_outcomes[partition_id] = "failed"
             if on_partition_done:
                 on_partition_done()
             continue
@@ -396,22 +431,23 @@ def backup_table(
         if status == "BACKUP_FAILED":
             log(f"  Retrying failed partition {partition}")
 
-        # Run backup.
+        # Run async backup + poll.
         try:
-            do_backup_partition(
+            bk_status, bk_info = do_backup_partition(
                 host, port, local_db, local_table,
-                partition, disk, cluster, timeout, path,
+                partition, disk, cluster, path,
             )
-            bk_status, bk_info = check_backup_status(host, port, path, cluster)
             if bk_status == "BACKUP_CREATED":
-                backed_bytes = int(bk_info.get("total_size", 0))
+                backed_bytes = int(bk_info.get("total_size", 0)) if bk_info else 0
                 log(f"  {partition} -> {format_size(backed_bytes)}")
                 results["created"] += 1
                 partition_outcomes[partition_id] = "created"
                 if on_bytes_created:
                     on_bytes_created(backed_bytes)
+            elif bk_status == "INTERRUPTED":
+                break
             else:
-                err = bk_info.get("error", "unknown") if bk_info else "no status"
+                err = bk_info.get("error", "unknown") if bk_info else "unknown"
                 log(f"  {partition} FAILED: {err}")
                 results["failed"] += 1
                 partition_outcomes[partition_id] = "failed"
@@ -464,6 +500,85 @@ def write_state_log(result: dict, cutoff: datetime | None, host: str, cluster: s
 # ---------------------------------------------------------------------------
 # Display modes
 # ---------------------------------------------------------------------------
+
+VERIFY_DIFF_THRESHOLD = 0.01  # 1% — warn if backup size differs by more than this
+
+
+def verify_tables(
+    host: str,
+    port: int,
+    database: str,
+    tables: list[str],
+    cutoff: datetime | None,
+    cluster: str | None,
+    disk: str,
+) -> bool:
+    """Compare system.backups metadata against system.parts for each partition.
+
+    Returns True if all partitions are verified OK.
+    """
+    all_ok = True
+
+    for table in tables:
+        local_db, local_table, is_dist = resolve_table(host, port, database, table)
+        partitions = get_partitions(host, port, local_db, local_table, cutoff, cluster)
+        total_rows = sum(int(p.get("rows", 0)) for p in partitions)
+        suffix = f" -> {local_table}" if is_dist else ""
+        print(f"\n{database}.{table}{suffix} ({len(partitions)} partitions, {total_rows:,} rows)")
+
+        counts = {"ok": 0, "mismatch": 0, "missing": 0, "failed": 0, "in_progress": 0}
+
+        for p in partitions:
+            partition = p["partition"]
+            partition_id = p["partition_id"]
+            cluster_bytes = int(p.get("bytes", 0))
+            path = make_backup_path(local_db, local_table, partition_id)
+            status, info = check_backup_status(host, port, path, cluster)
+
+            if status == "BACKUP_CREATED":
+                backup_bytes = int(info.get("total_size", 0))
+                if cluster_bytes == 0:
+                    pct = 0.0
+                else:
+                    pct = (backup_bytes - cluster_bytes) / cluster_bytes
+                pct_str = f"{pct:+.1%}"
+                if abs(pct) > VERIFY_DIFF_THRESHOLD:
+                    print(f"  {partition:>15}   WARN   {format_size(backup_bytes):>10} backup   {format_size(cluster_bytes):>10} cluster   ({pct_str})")
+                    counts["mismatch"] += 1
+                else:
+                    print(f"  {partition:>15}   OK     {format_size(backup_bytes):>10} backup   {format_size(cluster_bytes):>10} cluster   ({pct_str})")
+                    counts["ok"] += 1
+            elif status == "CREATING_BACKUP":
+                started = info.get("start_time", "?") if info else "?"
+                print(f"  {partition:>15}   PROG   in progress (since {started})")
+                counts["in_progress"] += 1
+            elif status == "BACKUP_FAILED":
+                err = info.get("error", "?") if info else "?"
+                print(f"  {partition:>15}   FAIL   {err}")
+                counts["failed"] += 1
+            else:
+                print(f"  {partition:>15}   MISS   no backup found")
+                counts["missing"] += 1
+
+        # Per-table summary.
+        parts = []
+        if counts["ok"]:
+            parts.append(f"{counts['ok']} ok")
+        if counts["mismatch"]:
+            parts.append(f"{counts['mismatch']} size mismatch")
+        if counts["missing"]:
+            parts.append(f"{counts['missing']} missing")
+        if counts["failed"]:
+            parts.append(f"{counts['failed']} failed")
+        if counts["in_progress"]:
+            parts.append(f"{counts['in_progress']} in progress")
+        print(f"  Summary: {', '.join(parts)}")
+
+        if counts["missing"] or counts["failed"] or counts["mismatch"]:
+            all_ok = False
+
+    return all_ok
+
 
 def show_status(host: str, port: int, database: str, tables: list[str], cutoff: datetime | None, cluster: str | None) -> None:
     """Print backup status for each table's partitions."""
@@ -554,13 +669,36 @@ def run_single_table(args, cluster: str | None, cutoff: datetime | None) -> None
             continue
 
         if status == "CREATING_BACKUP":
-            print(f"  Backup in progress (since {info.get('start_time', '?')})")
-            results["in_progress"] += 1
-            partition_outcomes[partition_id] = "in_progress"
+            started = info.get("start_time", "?") if info else "?"
+            print(f"  Waiting for in-progress backup (since {started})...", end="", flush=True)
+            while not _shutdown:
+                time.sleep(POLL_INTERVAL)
+                status, info = check_backup_status(args.host, args.port, path, cluster)
+                if status != "CREATING_BACKUP":
+                    break
+                print(".", end="", flush=True)
+            print()
+            if _shutdown:
+                print("\nInterrupted — backup will continue on the cluster")
+                break
+            if status == "BACKUP_CREATED":
+                backed = int(info.get("total_size", 0)) if info else 0
+                bytes_created += backed
+                elapsed = time.monotonic() - t0
+                throughput = (bytes_created / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                num_files = info.get("num_files", "?") if info else "?"
+                print(f"  Completed ({num_files} files, {format_size(backed)}) [{throughput:.1f} MB/s avg]")
+                results["created"] += 1
+                partition_outcomes[partition_id] = "created"
+            else:
+                err = info.get("error", "unknown") if info else "unknown"
+                print(f"  FAILED after wait: {err}")
+                results["failed"] += 1
+                partition_outcomes[partition_id] = "failed"
             continue
 
         if status == "BACKUP_FAILED":
-            print(f"  Previous backup failed: {info.get('error', '?')}")
+            print(f"  Previous backup failed: {info.get('error', '?') if info else '?'}")
             print(f"  Retrying...")
 
         try:
@@ -571,22 +709,37 @@ def run_single_table(args, cluster: str | None, cutoff: datetime | None) -> None
                 f" PARTITIONS {partition_expr}"
                 f"{cluster_clause}"
                 f" TO Disk('{args.disk}', '{path}')"
-                f" SETTINGS allow_backup_broken_projections = 1"
-            )
+                f" ASYNC"
+                    )
             print(f"  SQL: {sql}")
-            query(args.host, args.port, sql, timeout=args.timeout)
+            query(args.host, args.port, sql, timeout=60)
 
-            bk_status, bk_info = check_backup_status(args.host, args.port, path, cluster)
+            # Poll until done.
+            bk_status, bk_info = None, None
+            print(f"  Polling...", end="", flush=True)
+            while not _shutdown:
+                time.sleep(POLL_INTERVAL)
+                bk_status, bk_info = check_backup_status(args.host, args.port, path, cluster)
+                if bk_status and bk_status != "CREATING_BACKUP":
+                    break
+                print(".", end="", flush=True)
+            print()
+
+            if _shutdown:
+                print("\nInterrupted — backup will continue on the cluster")
+                break
+
             if bk_status == "BACKUP_CREATED":
-                backed = int(bk_info.get("total_size", 0))
+                backed = int(bk_info.get("total_size", 0)) if bk_info else 0
                 bytes_created += backed
                 elapsed = time.monotonic() - t0
                 throughput = (bytes_created / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                print(f"  OK ({bk_info.get('num_files', '?')} files, {format_size(backed)}) [{throughput:.1f} MB/s avg]")
+                num_files = bk_info.get("num_files", "?") if bk_info else "?"
+                print(f"  OK ({num_files} files, {format_size(backed)}) [{throughput:.1f} MB/s avg]")
                 results["created"] += 1
                 partition_outcomes[partition_id] = "created"
             else:
-                err = bk_info.get("error", "unknown") if bk_info else "no status"
+                err = bk_info.get("error", "unknown") if bk_info else "unknown"
                 print(f"  FAILED: {err}")
                 results["failed"] += 1
                 partition_outcomes[partition_id] = "failed"
@@ -733,7 +886,6 @@ def run_multi_table(args, cluster: str | None, cutoff: datetime | None) -> None:
                 cutoff=cutoff,
                 disk=args.disk,
                 cluster=cluster,
-                timeout=args.timeout,
                 log=log,
                 on_partition_done=on_partition_done,
                 on_bytes_created=on_bytes_created,
@@ -817,6 +969,7 @@ def main() -> None:
     parser.add_argument("--no-cluster", action="store_true", help="Run backup locally (no ON CLUSTER)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be backed up")
     parser.add_argument("--status", action="store_true", help="Show backup status for each partition")
+    parser.add_argument("--verify", action="store_true", help="Verify backups: compare system.backups sizes vs system.parts")
     parser.add_argument("--all-partitions", action="store_true", help="Include all partitions (ignore date filter)")
     parser.add_argument(
         "--max-concurrent", type=int, default=DEFAULT_MAX_CONCURRENT,
@@ -837,6 +990,12 @@ def main() -> None:
 
     if args.status:
         show_status(args.host, args.port, args.database, args.table, cutoff, cluster)
+        return
+
+    if args.verify:
+        ok = verify_tables(args.host, args.port, args.database, args.table, cutoff, cluster, args.disk)
+        if not ok:
+            sys.exit(1)
         return
 
     if args.dry_run:
