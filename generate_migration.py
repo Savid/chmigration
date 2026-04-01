@@ -650,9 +650,17 @@ def transform_local_table(
             base_partition = "meta_network_name"
         obj.partition = ensure_partition_prefix(base_partition, "meta_network_name")
 
+    obj.settings = None
+    settings_overrides = local_cfg.get("settings", {}).get("overrides", {})
+    if obj.name in settings_overrides:
+        obj.settings = settings_overrides[obj.name]
+
     order_cfg = local_cfg.get("order", {})
+    order_overrides = order_cfg.get("overrides", {})
     keep_original = set(order_cfg.get("keep_original_order_tables", []))
-    if obj.name not in keep_original:
+    if obj.name in order_overrides:
+        obj.order = order_overrides[obj.name]
+    elif obj.name not in keep_original:
         first_key_overrides = order_cfg.get("first_key_overrides", {})
         first_key = first_key_overrides.get(obj.name, "meta_network_name")
         obj.order = ensure_order_prefix(obj.order, first_key)
@@ -848,6 +856,8 @@ def render_table_sql(obj: SQLObject) -> str:
         lines.append(f"PARTITION BY {obj.partition}")
     if obj.order:
         lines.append(f"ORDER BY {obj.order}")
+    if obj.settings:
+        lines.append(f"SETTINGS {obj.settings}")
     if obj.comment:
         lines.append(f"COMMENT {obj.comment}")
     lines[-1] = lines[-1] + ";"

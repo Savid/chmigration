@@ -179,12 +179,17 @@ local_rules:
       default.mempool_dumpster_transaction_local: (chain_id, toYYYYMM(timestamp))
       admin.cryo_local: meta_network_name
       admin.execution_block_local: meta_network_name
+  settings:
+    overrides:
+      default.beacon_api_eth_v1_events_attestation_local: "allow_nullable_key = 1"
   order:
     keep_original_order_tables:
       - admin.cryo_local
       - admin.execution_block_local
       - default.imported_sources_local
       - default.libp2p_peer_local
+    overrides:
+      default.beacon_api_eth_v1_events_attestation_local: (meta_network_name, slot_start_date_time, meta_client_name, attesting_validator_index, attesting_validator_committee_index, aggregation_bits, beacon_block_root)
     first_key_overrides:
       default.block_native_mempool_transaction_local: network
       default.mempool_dumpster_transaction_local: chain_id
