@@ -571,8 +571,9 @@ def optimize_table(
         total_rows = int(part_info.get("total_rows", 0))
         bytes_on_disk = int(part_info.get("bytes_on_disk", 0))
 
-        if part_count <= 1:
-            log(f"  {partition_id}  SKIP   parts=1  rows={total_rows:>12,}  size={format_size(bytes_on_disk)}")
+        num_nodes = len(nodes) if nodes else 1
+        if part_count <= num_nodes:
+            log(f"  {partition_id}  SKIP   parts={part_count} ({num_nodes} nodes)  rows={total_rows:>12,}  size={format_size(bytes_on_disk)}")
             results["skipped"] += 1
             details.append({
                 "partition_id": partition_id,
