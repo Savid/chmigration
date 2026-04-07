@@ -262,6 +262,9 @@ def submit_optimize(
     back to ON CLUSTER which goes through the DDL queue.
     """
     if nodes:
+        # Fire-and-forget: use a short HTTP timeout to dispatch the OPTIMIZE
+        # on each node.  The server continues executing after the client
+        # disconnects.  We rely on poll_optimize_done to track completion.
         sql = (
             f"OPTIMIZE TABLE `{database}`.`{table}`"
             f" PARTITION ID '{partition_id}'"
@@ -269,7 +272,13 @@ def submit_optimize(
             f" SETTINGS optimize_throw_if_noop = 0"
         )
         for node_host, node_port in nodes:
-            query(node_host, node_port, sql, timeout=60, user=user, password=password)
+            try:
+                query(node_host, node_port, sql, timeout=5, user=user, password=password)
+            except ClickHouseError as e:
+                # Timeout is expected — the OPTIMIZE runs server-side.
+                if "timed out" in str(e).lower() or "timeout" in str(e).lower():
+                    continue
+                raise
     else:
         cluster_clause = f" ON CLUSTER '{cluster}'" if cluster else ""
         settings = ["optimize_throw_if_noop = 0"]
