@@ -2,34 +2,35 @@
 """Migrate data from refined cluster (old schema) to raw cluster (new schema).
 
 Reads per-table definitions from tables.yaml, then for each table + partition
-executes INSERT INTO FUNCTION cluster('{raw}', db, table) SELECT <columns>
-FROM refined_distributed_table WHERE _partition_id = '...'.
+executes INSERT INTO db.table SELECT <columns>
+FROM cluster('{refined_cluster}', db, table) WHERE _partition_id = '...'.
 
-Uses the pre-configured raw_cluster remote server on the refined cluster.
+Connects to the raw cluster and uses the pre-configured refined_cluster
+remote server to read from the refined cluster.
 
 Usage:
     # Dry run
     python migrate/migrate.py \\
-      --host refined-endpoint --user admin --password secret \\
+      --host raw-endpoint --user admin --password secret \\
       --database default \\
       --table beacon_api_eth_v1_events_block \\
       --dry-run
 
     # Migrate specific tables
     python migrate/migrate.py \\
-      --host refined-endpoint --user admin --password secret \\
+      --host raw-endpoint --user admin --password secret \\
       --database default \\
       --table beacon_api_eth_v1_events_block canonical_beacon_block
 
     # Migrate all tables in a database
     python migrate/migrate.py \\
-      --host refined-endpoint --user admin --password secret \\
+      --host raw-endpoint --user admin --password secret \\
       --database default
 
-    # Custom raw cluster name
+    # Custom refined cluster name
     python migrate/migrate.py \\
-      --host refined-endpoint --user admin --password secret \\
-      --raw-cluster my_raw_cluster \\
+      --host raw-endpoint --user admin --password secret \\
+      --refined-cluster my_refined_cluster \\
       --database default
 """
 
@@ -124,35 +125,6 @@ def query_json_rows(
 
 
 # ---------------------------------------------------------------------------
-# Table resolution
-# ---------------------------------------------------------------------------
-
-def resolve_table(host: str, port: int, database: str, table: str,
-                  user: str | None = None, password: str | None = None) -> tuple[str, str, bool]:
-    """Resolve a table name — if Distributed, return the underlying local table."""
-    rows = query_json_rows(
-        host, port,
-        f"SELECT engine, engine_full FROM system.tables "
-        f"WHERE database = '{database}' AND name = '{table}'",
-        user=user, password=password,
-    )
-    if not rows:
-        return database, table, False
-
-    engine = rows[0].get("engine", "")
-    engine_full = rows[0].get("engine_full", "")
-
-    if engine != "Distributed":
-        return database, table, False
-
-    m = re.match(r"Distributed\(\s*'[^']+'\s*,\s*'([^']+)'\s*,\s*'([^']+)'", engine_full)
-    if m:
-        return m.group(1), m.group(2), True
-
-    return database, table, False
-
-
-# ---------------------------------------------------------------------------
 # Partition discovery
 # ---------------------------------------------------------------------------
 
@@ -161,19 +133,14 @@ def get_all_partitions(
     port: int,
     database: str,
     table: str,
-    cluster: str | None = None,
+    refined_cluster: str,
     user: str | None = None,
     password: str | None = None,
 ) -> list[str]:
-    """Get all partition IDs from system.parts on refined cluster."""
-    source = (
-        f"clusterAllReplicas('{cluster}', system.parts)"
-        if cluster
-        else "system.parts"
-    )
+    """Get all partition IDs from the refined cluster via the remote server."""
     sql = (
         f"SELECT DISTINCT partition_id "
-        f"FROM {source} "
+        f"FROM clusterAllReplicas('{refined_cluster}', system.parts) "
         f"WHERE database = '{database}' AND table = '{table}' AND active = 1 "
         f"ORDER BY partition_id"
     )
@@ -187,12 +154,14 @@ def get_partition_row_count(
     database: str,
     table: str,
     partition_id: str,
+    refined_cluster: str,
     user: str | None = None,
     password: str | None = None,
 ) -> int:
-    """Quick row count for a partition via system.parts (no full scan)."""
+    """Quick row count for a partition via system.parts on refined (no full scan)."""
     sql = (
-        f"SELECT sum(rows) AS cnt FROM system.parts "
+        f"SELECT sum(rows) AS cnt "
+        f"FROM clusterAllReplicas('{refined_cluster}', system.parts) "
         f"WHERE database = '{database}' AND table = '{table}' "
         f"AND partition_id = '{partition_id}' AND active = 1"
     )
@@ -235,13 +204,12 @@ def find_table_def(defs: list[dict], database: str, table: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def migrate_table(
-    refined_host: str,
-    refined_port: int,
-    refined_user: str | None,
-    refined_password: str | None,
-    raw_cluster: str,
+    raw_host: str,
+    raw_port: int,
+    raw_user: str | None,
+    raw_password: str | None,
+    refined_cluster: str,
     table_def: dict,
-    refined_cluster: str | None = None,
     timeout: int = DEFAULT_TIMEOUT,
     retries: int = DEFAULT_RETRIES,
     dry_run: bool = False,
@@ -255,13 +223,13 @@ def migrate_table(
     dist_table = table_def["distributed_table"]
     select_columns = table_def["select_columns"]
 
-    # Discover partitions on refined cluster.
+    # Discover partitions on refined cluster (queried via raw's remote server).
     if partition_filter:
         partitions = partition_filter
     else:
         partitions = get_all_partitions(
-            refined_host, refined_port, database, local_table,
-            refined_cluster, refined_user, refined_password,
+            raw_host, raw_port, database, local_table,
+            refined_cluster, raw_user, raw_password,
         )
 
     results = {"ok": 0, "skipped": 0, "error": 0}
@@ -284,19 +252,21 @@ def migrate_table(
         if _shutdown:
             break
 
-        # Build the INSERT ... SELECT query using the pre-configured raw cluster.
+        # INSERT into raw's distributed table (has sharding key),
+        # SELECT from refined via the pre-configured refined_cluster remote server.
         insert_sql = (
-            f"INSERT INTO FUNCTION cluster('{raw_cluster}', "
-            f"'{database}', '{dist_table}')\n"
+            f"INSERT INTO `{database}`.`{dist_table}`\n"
             f"SELECT\n    {col_list}\n"
-            f"FROM `{database}`.`{dist_table}`\n"
-            f"WHERE _partition_id = '{partition_id}'"
+            f"FROM cluster('{refined_cluster}', "
+            f"'{database}', '{local_table}')\n"
+            f"WHERE _partition_id = '{partition_id}'\n"
+            f"SETTINGS force_primary_key = 0"
         )
 
         if dry_run:
             row_count = get_partition_row_count(
-                refined_host, refined_port, database, local_table,
-                partition_id, refined_user, refined_password,
+                raw_host, raw_port, database, local_table,
+                partition_id, refined_cluster, raw_user, raw_password,
             )
             log(f"  {partition_id}  DRY    rows={row_count:>12,}")
             details.append({
@@ -311,8 +281,8 @@ def migrate_table(
         for attempt in range(1, retries + 1):
             try:
                 query(
-                    refined_host, refined_port, insert_sql,
-                    timeout=timeout, user=refined_user, password=refined_password,
+                    raw_host, raw_port, insert_sql,
+                    timeout=timeout, user=raw_user, password=raw_password,
                 )
                 log(f"  {partition_id}  OK")
                 results["ok"] += 1
@@ -349,13 +319,13 @@ def migrate_table(
     }
 
 
-def write_state_log(result: dict, refined_host: str, raw_cluster: str) -> None:
+def write_state_log(result: dict, raw_host: str, refined_cluster: str) -> None:
     from datetime import datetime
     entry = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         **result,
-        "refined_host": refined_host,
-        "raw_cluster": raw_cluster,
+        "raw_host": raw_host,
+        "refined_cluster": refined_cluster,
         "partitions_total": len(result.get("partition_detail", [])),
     }
     with open(STATE_LOG, "a", encoding="utf-8") as f:
@@ -377,20 +347,19 @@ def run_single_table(args, table_def: dict) -> None:
     else:
         partitions = get_all_partitions(
             args.host, args.port, database, local_table,
-            args.cluster, args.user, args.password,
+            args.refined_cluster, args.user, args.password,
         )
     mode = "DRY RUN" if args.dry_run else "migrate"
     print(f"Table: {database}.{dist_table} ({local_table})")
     print(f"Partitions: {len(partitions)} ({mode})\n")
 
     result = migrate_table(
-        refined_host=args.host,
-        refined_port=args.port,
-        refined_user=args.user,
-        refined_password=args.password,
-        raw_cluster=args.raw_cluster,
+        raw_host=args.host,
+        raw_port=args.port,
+        raw_user=args.user,
+        raw_password=args.password,
+        refined_cluster=args.refined_cluster,
         table_def=table_def,
-        refined_cluster=args.cluster,
         timeout=args.timeout,
         retries=args.retries,
         dry_run=args.dry_run,
@@ -405,7 +374,7 @@ def run_single_table(args, table_def: dict) -> None:
     print(f"  Error:    {result['error']:>4}")
 
     if not args.dry_run:
-        write_state_log(result, args.host, args.raw_cluster)
+        write_state_log(result, args.host, args.refined_cluster)
         print(f"  State:    {STATE_LOG}")
 
     if result["error"]:
@@ -425,7 +394,7 @@ def run_multi_table(args, table_defs: list[dict]) -> None:
         local_table = td["local_table"]
         partitions = get_all_partitions(
             args.host, args.port, database, local_table,
-            args.cluster, args.user, args.password,
+            args.refined_cluster, args.user, args.password,
         )
         table_info.append({
             "def": td,
@@ -492,13 +461,12 @@ def run_multi_table(args, table_defs: list[dict]) -> None:
                 progress.update(tid, status_text=short)
 
             result = migrate_table(
-                refined_host=args.host,
-                refined_port=args.port,
-                refined_user=args.user,
-                refined_password=args.password,
-                raw_cluster=args.raw_cluster,
+                raw_host=args.host,
+                raw_port=args.port,
+                raw_user=args.user,
+                raw_password=args.password,
+                refined_cluster=args.refined_cluster,
                 table_def=td,
-                refined_cluster=args.cluster,
                 timeout=args.timeout,
                 retries=args.retries,
                 dry_run=args.dry_run,
@@ -524,7 +492,7 @@ def run_multi_table(args, table_defs: list[dict]) -> None:
                     result = future.result()
                     all_results.append(result)
                     if not args.dry_run:
-                        write_state_log(result, args.host, args.raw_cluster)
+                        write_state_log(result, args.host, args.refined_cluster)
                     if result["error"] > 0:
                         has_failures = True
                 except Exception as e:
@@ -563,16 +531,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Migrate data from refined cluster to raw cluster with schema transformations",
     )
-    # Refined cluster (source).
-    parser.add_argument("--host", default="localhost", help="Refined ClickHouse HTTP host")
-    parser.add_argument("--port", type=int, default=8123, help="Refined ClickHouse HTTP port")
-    parser.add_argument("--user", default=None, help="Refined ClickHouse user")
-    parser.add_argument("--password", default=None, help="Refined ClickHouse password")
-    parser.add_argument("--cluster", default="replicated", help="Refined cluster name for partition discovery")
-    parser.add_argument("--no-cluster", action="store_true", help="Don't use clusterAllReplicas")
+    # Raw cluster (target) — we connect here directly.
+    parser.add_argument("--host", default="localhost", help="Raw ClickHouse HTTP host")
+    parser.add_argument("--port", type=int, default=8123, help="Raw ClickHouse HTTP port")
+    parser.add_argument("--user", default=None, help="Raw ClickHouse user")
+    parser.add_argument("--password", default=None, help="Raw ClickHouse password")
 
-    # Raw cluster (target) — uses pre-configured remote server on refined.
-    parser.add_argument("--raw-cluster", default="raw_cluster", help="Remote cluster name for raw target (default: raw_cluster)")
+    # Refined cluster (source) — uses pre-configured remote server on raw.
+    parser.add_argument("--refined-cluster", default="refined_cluster", help="Remote cluster name for refined source (default: refined_cluster)")
 
     # Table selection.
     parser.add_argument("--database", required=True, help="Database name")
@@ -587,9 +553,6 @@ def main() -> None:
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Retry failed partitions N times")
 
     args = parser.parse_args()
-
-    if args.no_cluster:
-        args.cluster = None
 
     if args.partition and (not args.table or len(args.table) != 1):
         parser.error("--partition requires exactly one --table")
