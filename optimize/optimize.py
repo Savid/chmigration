@@ -452,15 +452,21 @@ def poll_optimize_done(
     password: str | None = None,
     timeout: int = DEFAULT_TIMEOUT,
     on_merge_progress: Callable[[str, list[dict] | None], None] | None = None,
+    num_nodes: int = 1,
 ) -> int:
     """Poll system.parts until the partition's part count drops (merge landed).
 
     Calls on_merge_progress(partition_id, nodes) each cycle where nodes is the
     per-host merge list or None when no merge is active.
 
+    When *num_nodes* > 1 (cluster with clusterAllReplicas monitoring), the
+    minimum possible part count is num_nodes (1 per replica).  If the count
+    is already at that minimum and no merge is active, returns immediately.
+
     Returns the final part count.  Raises TimeoutError if timeout is exceeded.
     """
     deadline = time.monotonic() + timeout
+    no_merge_cycles = 0
     while not _shutdown:
         time.sleep(POLL_INTERVAL)
         current = get_partition_part_count(
@@ -471,11 +477,28 @@ def poll_optimize_done(
                 on_merge_progress(partition_id, None)
             return current
 
+        merge_nodes = get_merge_progress(
+            host, port, database, table, partition_id, cluster, user, password,
+        )
+
+        # Already at minimum (1 part per replica) and no merge running — done.
+        if current <= num_nodes and not merge_nodes:
+            if on_merge_progress:
+                on_merge_progress(partition_id, None)
+            return current
+
+        # No merge running and count hasn't dropped — OPTIMIZE was a no-op.
+        if not merge_nodes:
+            no_merge_cycles += 1
+            if no_merge_cycles >= 3:
+                if on_merge_progress:
+                    on_merge_progress(partition_id, None)
+                return current
+        else:
+            no_merge_cycles = 0
+
         if on_merge_progress:
-            nodes = get_merge_progress(
-                host, port, database, table, partition_id, cluster, user, password,
-            )
-            on_merge_progress(partition_id, nodes)
+            on_merge_progress(partition_id, merge_nodes)
 
         if time.monotonic() > deadline:
             if on_merge_progress:
@@ -583,6 +606,7 @@ def optimize_table(
                     host, port, local_db, local_table,
                     partition_id, part_count, cluster, user, password, timeout,
                     on_merge_progress=on_merge_progress,
+                    num_nodes=len(nodes) if nodes else 1,
                 )
                 log(f"  {partition_id}  DONE   parts={part_count} -> {new_count}")
                 with results_lock:
