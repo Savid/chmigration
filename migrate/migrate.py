@@ -36,7 +36,6 @@ Usage:
 
 import argparse
 import json
-import re
 import sys
 import time
 import urllib.error
@@ -61,9 +60,11 @@ from rich.progress import Progress, TextColumn, BarColumn, MofNCompleteColumn, T
 DEFAULT_TIMEOUT = 3600
 DEFAULT_MAX_CONCURRENT = 5
 DEFAULT_RETRIES = 3
+DEFAULT_POLL_INTERVAL = 10
 SCRIPT_DIR = Path(__file__).resolve().parent
 TABLES_YAML = SCRIPT_DIR / "tables.yaml"
 STATE_LOG = SCRIPT_DIR / "state.jsonl"
+QUERY_ID_PREFIX = "migrate"
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +84,7 @@ def query(
     timeout: int = DEFAULT_TIMEOUT,
     user: str | None = None,
     password: str | None = None,
+    query_id: str | None = None,
 ) -> str:
     params: dict[str, str | int] = {
         "receive_timeout": timeout,
@@ -92,6 +94,8 @@ def query(
         params["user"] = user
     if password:
         params["password"] = password
+    if query_id:
+        params["query_id"] = query_id
     url = f"http://{host}:{port}/?{urllib.parse.urlencode(params)}"
     data = sql.encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
@@ -122,6 +126,102 @@ def query_json_rows(
         if line:
             rows.append(json.loads(line))
     return rows
+
+
+def make_query_id(database: str, table: str, partition_id: str) -> str:
+    return f"{QUERY_ID_PREFIX}-{database}-{table}-{partition_id}"
+
+
+def submit_async(
+    host: str,
+    port: int,
+    sql: str,
+    query_id: str,
+    user: str | None = None,
+    password: str | None = None,
+) -> None:
+    """Submit an INSERT in a background thread. Does not block."""
+    params: dict[str, str | int] = {
+        "receive_timeout": 0,
+        "send_timeout": 0,
+        "query_id": query_id,
+        "wait_end_of_query": 1,
+    }
+    if user:
+        params["user"] = user
+    if password:
+        params["password"] = password
+    url = f"http://{host}:{port}/?{urllib.parse.urlencode(params)}"
+    data = sql.encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    # Block until ClickHouse finishes (timeouts are 0 = unlimited server-side).
+    # Python socket timeout is set very high as a safety net.
+    try:
+        with urllib.request.urlopen(req, timeout=86400) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace").strip()
+        raise ClickHouseError(body, status=e.code) from e
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise ClickHouseError(f"Connection error ({host}:{port}): {e}") from e
+
+
+# ---------------------------------------------------------------------------
+# Query status helpers (resume support)
+# ---------------------------------------------------------------------------
+
+def check_partition_status(
+    host: str,
+    port: int,
+    query_id: str,
+    user: str | None = None,
+    password: str | None = None,
+) -> str:
+    """Check if a migration query already ran or is running.
+
+    Returns: "completed", "running", or "none".
+    """
+    # Check system.processes first (is it running right now?).
+    running = query_json_rows(
+        host, port,
+        f"SELECT query_id FROM system.processes WHERE query_id = '{query_id}'",
+        timeout=10, user=user, password=password,
+    )
+    if running:
+        return "running"
+
+    # Check query_log for successful completion (type=QueryFinish, exception_code=0).
+    finished = query_json_rows(
+        host, port,
+        f"SELECT query_id FROM system.query_log "
+        f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND exception_code = 0 "
+        f"LIMIT 1",
+        timeout=10, user=user, password=password,
+    )
+    if finished:
+        return "completed"
+
+    return "none"
+
+
+def get_running_progress(
+    host: str,
+    port: int,
+    query_ids: list[str],
+    user: str | None = None,
+    password: str | None = None,
+) -> dict[str, dict]:
+    """Get progress for running migration queries from system.processes."""
+    if not query_ids:
+        return {}
+    id_list = ", ".join(f"'{qid}'" for qid in query_ids)
+    rows = query_json_rows(
+        host, port,
+        f"SELECT query_id, read_rows, total_rows_approx, elapsed, read_bytes "
+        f"FROM system.processes WHERE query_id IN ({id_list})",
+        timeout=10, user=user, password=password,
+    )
+    return {r["query_id"]: r for r in rows}
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +303,81 @@ def find_table_def(defs: list[dict], database: str, table: str) -> dict | None:
 # Per-table migration
 # ---------------------------------------------------------------------------
 
+def _submit_and_poll(
+    host: str,
+    port: int,
+    sql: str,
+    query_id: str,
+    user: str | None,
+    password: str | None,
+    log: Callable[[str], None],
+    partition_id: str = "",
+    poll_interval: int = DEFAULT_POLL_INTERVAL,
+) -> None:
+    """Submit an INSERT in a background thread and poll progress until done."""
+    import threading
+
+    error_holder: list[Exception] = []
+
+    def run_insert():
+        try:
+            submit_async(host, port, sql, query_id=query_id, user=user, password=password)
+        except Exception as e:
+            error_holder.append(e)
+
+    t = threading.Thread(target=run_insert, daemon=True)
+    t.start()
+
+    # Give ClickHouse a moment to register the query in system.processes.
+    time.sleep(2)
+
+    while t.is_alive() and not _shutdown:
+        progress = get_running_progress(host, port, [query_id], user, password)
+        if query_id in progress:
+            info = progress[query_id]
+            rows = int(info.get("read_rows", 0))
+            total = int(info.get("total_rows_approx", 0))
+            elapsed = float(info.get("elapsed", 0))
+            pct = f"{rows/total*100:.0f}%" if total > 0 else "?"
+            log(f"  {partition_id}  RUN    {rows:>12,}/{total:>12,} rows ({pct}) {elapsed:.0f}s")
+        t.join(timeout=poll_interval)
+
+    t.join()
+
+    if error_holder:
+        raise error_holder[0]
+
+
+def _wait_for_query(
+    host: str,
+    port: int,
+    query_id: str,
+    user: str | None,
+    password: str | None,
+    log: Callable[[str], None],
+    partition_id: str = "",
+    poll_interval: int = DEFAULT_POLL_INTERVAL,
+) -> None:
+    """Poll system.processes until a running query finishes."""
+    while not _shutdown:
+        time.sleep(poll_interval)
+        progress = get_running_progress(host, port, [query_id], user, password)
+        if query_id not in progress:
+            # Query is no longer in processes — check if it succeeded.
+            status = check_partition_status(host, port, query_id, user, password)
+            if status == "completed":
+                log(f"  {partition_id}  OK     (resumed)")
+                return
+            log(f"  {partition_id}  OK     query finished")
+            return
+        info = progress[query_id]
+        rows = int(info.get("read_rows", 0))
+        total = int(info.get("total_rows_approx", 0))
+        elapsed = float(info.get("elapsed", 0))
+        pct = f"{rows/total*100:.0f}%" if total > 0 else "?"
+        log(f"  {partition_id}  RUN    {rows:>12,}/{total:>12,} rows ({pct}) {elapsed:.0f}s")
+
+
 def migrate_table(
     raw_host: str,
     raw_port: int,
@@ -216,8 +391,13 @@ def migrate_table(
     partition_filter: list[str] | None = None,
     log: Callable[[str], None] = print,
     on_partition_done: Callable[[], None] | None = None,
+    on_partition_status: Callable[[str, str, str], None] | None = None,
 ) -> dict:
-    """Migrate all partitions of a single table from refined to raw."""
+    """Migrate all partitions of a single table from refined to raw.
+
+    on_partition_status(partition_id, query_id, status) is called with
+    "completed"/"running"/"submitted"/"ok"/"error" for progress tracking.
+    """
     database = table_def["database"]
     local_table = table_def["local_table"]
     dist_table = table_def["distributed_table"]
@@ -245,12 +425,17 @@ def migrate_table(
             "partition_detail": [],
         }
 
+    # Load locally completed partitions for resume.
+    completed_qids = load_completed_partitions()
+
     # Build the SELECT column list.
     col_list = ",\n    ".join(select_columns)
 
     for partition_id in partitions:
         if _shutdown:
             break
+
+        qid = make_query_id(database, dist_table, partition_id)
 
         # INSERT into raw's distributed table (has sharding key),
         # SELECT from refined via the pre-configured refined_cluster remote server.
@@ -278,18 +463,86 @@ def migrate_table(
                 on_partition_done()
             continue
 
+        # --- Resume: check local state first, then ClickHouse ---
+        if qid in completed_qids:
+            log(f"  {partition_id}  SKIP   already completed (local)")
+            results["skipped"] += 1
+            details.append({
+                "partition_id": partition_id,
+                "outcome": "skipped",
+                "query_id": qid,
+            })
+            if on_partition_status:
+                on_partition_status(partition_id, qid, "completed")
+            if on_partition_done:
+                on_partition_done()
+            continue
+
+        # Fallback: check ClickHouse for running/completed queries.
+        status = check_partition_status(
+            raw_host, raw_port, qid, raw_user, raw_password,
+        )
+
+        if status == "completed":
+            log(f"  {partition_id}  SKIP   already completed (query_log)")
+            results["skipped"] += 1
+            details.append({
+                "partition_id": partition_id,
+                "outcome": "skipped",
+                "query_id": qid,
+            })
+            # Record locally so next restart is faster.
+            write_partition_state(database, dist_table, partition_id, qid, "ok")
+            if on_partition_status:
+                on_partition_status(partition_id, qid, "completed")
+            if on_partition_done:
+                on_partition_done()
+            continue
+
+        if status == "running":
+            log(f"  {partition_id}  WAIT   already running ({qid})")
+            if on_partition_status:
+                on_partition_status(partition_id, qid, "running")
+            # Poll until the running query finishes.
+            _wait_for_query(
+                raw_host, raw_port, qid, raw_user, raw_password, log,
+                partition_id=partition_id,
+            )
+            results["ok"] += 1
+            details.append({
+                "partition_id": partition_id,
+                "outcome": "ok",
+                "query_id": qid,
+                "resumed": True,
+            })
+            write_partition_state(database, dist_table, partition_id, qid, "ok")
+            if on_partition_done:
+                on_partition_done()
+            continue
+
+        # --- Submit new INSERT and poll for progress ---
+        if on_partition_status:
+            on_partition_status(partition_id, qid, "submitted")
+
         for attempt in range(1, retries + 1):
+            if _shutdown:
+                break
             try:
-                query(
+                _submit_and_poll(
                     raw_host, raw_port, insert_sql,
-                    timeout=timeout, user=raw_user, password=raw_password,
+                    query_id=qid, user=raw_user, password=raw_password,
+                    log=log, partition_id=partition_id,
                 )
                 log(f"  {partition_id}  OK")
                 results["ok"] += 1
                 details.append({
                     "partition_id": partition_id,
                     "outcome": "ok",
+                    "query_id": qid,
                 })
+                write_partition_state(database, dist_table, partition_id, qid, "ok")
+                if on_partition_status:
+                    on_partition_status(partition_id, qid, "ok")
                 break
 
             except (ClickHouseError, Exception) as e:
@@ -305,7 +558,13 @@ def migrate_table(
                     "partition_id": partition_id,
                     "outcome": "error",
                     "error": err,
+                    "query_id": qid,
                 })
+                write_partition_state(
+                    database, dist_table, partition_id, qid, "error",
+                )
+                if on_partition_status:
+                    on_partition_status(partition_id, qid, "error")
 
         if on_partition_done:
             on_partition_done()
@@ -319,17 +578,51 @@ def migrate_table(
     }
 
 
-def write_state_log(result: dict, raw_host: str, refined_cluster: str) -> None:
-    from datetime import datetime
+def load_completed_partitions(state_path: Path = STATE_LOG) -> set[str]:
+    """Load query_ids that completed successfully from the local state log."""
+    completed: set[str] = set()
+    if not state_path.exists():
+        return completed
+    for line in state_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("outcome") == "ok" and entry.get("query_id"):
+            completed.add(entry["query_id"])
+    return completed
+
+
+_state_lock = __import__("threading").Lock()
+
+
+def write_partition_state(
+    database: str,
+    table: str,
+    partition_id: str,
+    query_id: str,
+    outcome: str,
+    read_rows: int = 0,
+    elapsed: float = 0,
+) -> None:
+    """Append a per-partition result to the state log (thread-safe)."""
+    from datetime import datetime, timezone
     entry = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        **result,
-        "raw_host": raw_host,
-        "refined_cluster": refined_cluster,
-        "partitions_total": len(result.get("partition_detail", [])),
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "database": database,
+        "table": table,
+        "partition_id": partition_id,
+        "query_id": query_id,
+        "outcome": outcome,
+        "read_rows": read_rows,
+        "elapsed_s": round(elapsed, 1),
     }
-    with open(STATE_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    with _state_lock:
+        with open(STATE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, separators=(",", ":")) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +667,6 @@ def run_single_table(args, table_def: dict) -> None:
     print(f"  Error:    {result['error']:>4}")
 
     if not args.dry_run:
-        write_state_log(result, args.host, args.refined_cluster)
         print(f"  State:    {STATE_LOG}")
 
     if result["error"]:
@@ -457,7 +749,7 @@ def run_multi_table(args, table_defs: list[dict]) -> None:
                 progress.update(overall_tid, status_text=f"{done_count} done")
 
             def log(msg: str):
-                short = msg.strip()[:60]
+                short = msg.strip()[:80]
                 progress.update(tid, status_text=short)
 
             result = migrate_table(
@@ -475,8 +767,11 @@ def run_multi_table(args, table_defs: list[dict]) -> None:
             )
 
             ok = result["ok"]
+            skipped = result["skipped"]
             bad = result["error"]
             status = f"done: {ok} ok"
+            if skipped > 0:
+                status += f", {skipped} skipped"
             if bad > 0:
                 status += f", [red]{bad} errors[/red]"
             progress.update(tid, status_text=status, completed=info["partitions"] or 1)
@@ -491,8 +786,6 @@ def run_multi_table(args, table_defs: list[dict]) -> None:
                 try:
                     result = future.result()
                     all_results.append(result)
-                    if not args.dry_run:
-                        write_state_log(result, args.host, args.refined_cluster)
                     if result["error"] > 0:
                         has_failures = True
                 except Exception as e:

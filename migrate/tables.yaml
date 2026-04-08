@@ -327,7 +327,6 @@ tables:
       - "`block_root`"
       - "`column_index`"
       - "`kzg_commitments_count`"
-      - "`kzg_commitments`"
       - "`meta_client_name`"
       - "`meta_client_version`"
       - "`meta_client_implementation`"

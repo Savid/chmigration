@@ -158,11 +158,47 @@ def resolve_table(host: str, port: int, database: str, table: str, user: str | N
 # Partition discovery
 # ---------------------------------------------------------------------------
 
+def extract_partition_date(partition: str) -> datetime | None:
+    """Try to extract a date from a partition value string.
+
+    Handles multiple formats found in ClickHouse partition keys:
+      - YYYY-MM-DD  (e.g. '2024-01-15' or ('mainnet', '2024-01-15'))
+      - YYYYMMDD    (e.g. 20240115)
+      - YYYYMM      (e.g. 202401 or ('mainnet', 202401))
+      - Simple integers with no date component (e.g. 1, 42) → returns None
+    """
+    # YYYY-MM-DD (with or without surrounding tuple)
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", partition)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+
+    # YYYYMMDD — exactly 8 consecutive digits, not part of a longer number
+    m = re.search(r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)", partition)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+
+    # YYYYMM — exactly 6 consecutive digits, not part of a longer number
+    m = re.search(r"(?<!\d)(\d{4})(\d{2})(?!\d)", partition)
+    if m:
+        year, month = int(m.group(1)), int(m.group(2))
+        if 2000 <= year <= 2100 and 1 <= month <= 12:
+            return datetime(year, month, 1)
+
+    return None
+
+
 def get_partitions(
     host: str,
     port: int,
     database: str,
     table: str,
+    before: datetime | None = None,
     cluster: str | None = None,
     user: str | None = None,
     password: str | None = None,
@@ -171,6 +207,10 @@ def get_partitions(
 
     Returns list of dicts with: partition_id, partition, part_count, total_rows,
     bytes_on_disk.  Sorted by partition_id.
+
+    When *before* is set, only partitions whose extracted date is strictly
+    before the cutoff are returned. Partitions with no recognisable date
+    component are skipped.
     """
     source = (
         f"clusterAllReplicas('{cluster}', system.parts)"
@@ -189,7 +229,21 @@ def get_partitions(
         f"GROUP BY partition_id, partition "
         f"ORDER BY partition_id"
     )
-    return query_json_rows(host, port, sql, user=user, password=password)
+    rows = query_json_rows(host, port, sql, user=user, password=password)
+
+    if before is None:
+        return rows
+
+    filtered: list[dict] = []
+    for row in rows:
+        partition = str(row["partition"])
+        dt = extract_partition_date(partition)
+        if dt is None:
+            continue
+        if dt < before:
+            filtered.append(row)
+
+    return filtered
 
 
 def get_unmerged_partitions(
@@ -197,12 +251,13 @@ def get_unmerged_partitions(
     port: int,
     database: str,
     table: str,
+    before: datetime | None = None,
     cluster: str | None = None,
     user: str | None = None,
     password: str | None = None,
 ) -> list[dict]:
     """Get partitions that have more than one active part (need merging)."""
-    all_parts = get_partitions(host, port, database, table, cluster, user, password)
+    all_parts = get_partitions(host, port, database, table, before, cluster, user, password)
     return [p for p in all_parts if int(p.get("part_count", 0)) > 1]
 
 
@@ -531,6 +586,7 @@ def optimize_table(
     port: int,
     database: str,
     table: str,
+    cutoff: datetime | None = None,
     cluster: str | None = None,
     user: str | None = None,
     password: str | None = None,
@@ -558,7 +614,7 @@ def optimize_table(
     if is_distributed:
         log(f"  {database}.{table} -> {local_db}.{local_table}")
 
-    all_parts = get_partitions(host, port, local_db, local_table, cluster, user, password)
+    all_parts = get_partitions(host, port, local_db, local_table, cutoff, cluster, user, password)
 
     results = {"optimized": 0, "skipped": 0, "failed": 0}
     details: list[dict] = []
@@ -692,6 +748,7 @@ def show_status(
     port: int,
     database: str,
     tables: list[str],
+    cutoff: datetime | None,
     cluster: str | None,
     user: str | None,
     password: str | None,
@@ -700,7 +757,7 @@ def show_status(
     for table in tables:
         local_db, local_table, is_dist = resolve_table(host, port, database, table, user, password)
         suffix = f" -> {local_table}" if is_dist else ""
-        parts = get_partitions(host, port, local_db, local_table, cluster, user, password)
+        parts = get_partitions(host, port, local_db, local_table, cutoff, cluster, user, password)
         if not parts:
             print(f"\n{database}.{table}{suffix}: no partitions found")
             continue
@@ -726,6 +783,7 @@ def show_dry_run(
     port: int,
     database: str,
     tables: list[str],
+    cutoff: datetime | None,
     cluster: str | None,
     user: str | None,
     password: str | None,
@@ -736,7 +794,7 @@ def show_dry_run(
     for table in tables:
         local_db, local_table, is_dist = resolve_table(host, port, database, table, user, password)
         suffix = f" -> {local_table}" if is_dist else ""
-        parts = get_partitions(host, port, local_db, local_table, cluster, user, password)
+        parts = get_partitions(host, port, local_db, local_table, cutoff, cluster, user, password)
 
         unmerged = [p for p in parts if int(p.get("part_count", 0)) > 1]
         merged = len(parts) - len(unmerged)
@@ -764,7 +822,7 @@ def show_dry_run(
 # Run modes
 # ---------------------------------------------------------------------------
 
-def run_single_table(args, cluster: str | None, nodes: list[tuple[str, int]] | None = None) -> None:
+def run_single_table(args, cluster: str | None, cutoff: datetime | None, nodes: list[tuple[str, int]] | None = None) -> None:
     table = args.table[0]
 
     local_db, local_table, is_distributed = resolve_table(
@@ -775,7 +833,7 @@ def run_single_table(args, cluster: str | None, nodes: list[tuple[str, int]] | N
     else:
         print(f"Local table: {local_db}.{local_table}")
 
-    all_parts = get_partitions(args.host, args.port, local_db, local_table, cluster, args.user, args.password)
+    all_parts = get_partitions(args.host, args.port, local_db, local_table, cutoff, cluster, args.user, args.password)
     if not all_parts:
         print("No partitions found")
         return
@@ -795,6 +853,7 @@ def run_single_table(args, cluster: str | None, nodes: list[tuple[str, int]] | N
         port=args.port,
         database=args.database,
         table=table,
+        cutoff=cutoff,
         cluster=cluster,
         user=args.user,
         password=args.password,
@@ -819,7 +878,7 @@ def run_single_table(args, cluster: str | None, nodes: list[tuple[str, int]] | N
         sys.exit(1)
 
 
-def run_multi_table(args, cluster: str | None, nodes: list[tuple[str, int]] | None = None) -> None:
+def run_multi_table(args, cluster: str | None, cutoff: datetime | None, nodes: list[tuple[str, int]] | None = None) -> None:
     import threading
 
     tables = args.table
@@ -832,7 +891,7 @@ def run_multi_table(args, cluster: str | None, nodes: list[tuple[str, int]] | No
         local_db, local_table, is_dist = resolve_table(
             args.host, args.port, args.database, table, args.user, args.password,
         )
-        parts = get_partitions(args.host, args.port, local_db, local_table, cluster, args.user, args.password)
+        parts = get_partitions(args.host, args.port, local_db, local_table, cutoff, cluster, args.user, args.password)
         unmerged = [p for p in parts if int(p.get("part_count", 0)) > 1]
         table_info.append({
             "source_table": table,
@@ -980,6 +1039,7 @@ def run_multi_table(args, cluster: str | None, nodes: list[tuple[str, int]] | No
                 port=args.port,
                 database=args.database,
                 table=table_name,
+                cutoff=cutoff,
                 cluster=cluster,
                 user=args.user,
                 password=args.password,
@@ -1051,6 +1111,15 @@ def run_multi_table(args, cluster: str | None, nodes: list[tuple[str, int]] | No
 # Main
 # ---------------------------------------------------------------------------
 
+def compute_cutoff(before: str | None) -> datetime:
+    """Return date cutoff. Partitions with date < cutoff are eligible."""
+    if before:
+        return datetime.strptime(before, "%Y-%m-%d")
+
+    now = datetime.now()
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Optimize ClickHouse tables partition by partition (OPTIMIZE TABLE FINAL)",
@@ -1062,12 +1131,17 @@ def main() -> None:
     parser.add_argument("--password", default=None, help="ClickHouse password")
     parser.add_argument("--database", required=True, help="Database name")
     parser.add_argument("--table", required=True, nargs="+", help="Table name(s)")
+    parser.add_argument(
+        "--before",
+        help="Optimize partitions strictly before YYYY-MM-DD (default: 1st of current month)",
+    )
     parser.add_argument("--cluster", default=DEFAULT_CLUSTER, help=f"Cluster name (default: {DEFAULT_CLUSTER})")
     parser.add_argument("--no-cluster", action="store_true", help="Don't use ON CLUSTER or clusterAllReplicas")
     parser.add_argument("--direct", action="store_true",
                         help="Send OPTIMIZE directly to each node (bypass DDL queue)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be optimized")
     parser.add_argument("--status", action="store_true", help="Show partition merge state")
+    parser.add_argument("--all-partitions", action="store_true", help="Include all partitions (ignore date filter)")
     parser.add_argument(
         "--max-concurrent", type=int, default=DEFAULT_MAX_CONCURRENT,
         help=f"Max tables to optimize concurrently (default: {DEFAULT_MAX_CONCURRENT})",
@@ -1095,6 +1169,11 @@ def main() -> None:
 
     cluster = None if args.no_cluster else args.cluster
 
+    cutoff: datetime | None = None
+    if not args.all_partitions:
+        cutoff = compute_cutoff(args.before)
+        print(f"Partition cutoff: before {cutoff.strftime('%Y-%m-%d')}")
+
     # Expand host pattern (auto-enables direct mode).
     nodes = None
     if "%s" in args.host or "%r" in args.host:
@@ -1119,17 +1198,17 @@ def main() -> None:
             print(f"  {node_host}:{node_port}")
 
     if args.status:
-        show_status(args.host, args.port, args.database, args.table, cluster, args.user, args.password)
+        show_status(args.host, args.port, args.database, args.table, cutoff, cluster, args.user, args.password)
         return
 
     if args.dry_run:
-        show_dry_run(args.host, args.port, args.database, args.table, cluster, args.user, args.password)
+        show_dry_run(args.host, args.port, args.database, args.table, cutoff, cluster, args.user, args.password)
         return
 
     if len(args.table) == 1:
-        run_single_table(args, cluster, nodes)
+        run_single_table(args, cluster, cutoff, nodes)
     else:
-        run_multi_table(args, cluster, nodes)
+        run_multi_table(args, cluster, cutoff, nodes)
 
 
 if __name__ == "__main__":
