@@ -59,6 +59,7 @@ from rich.progress import Progress, TextColumn, BarColumn, MofNCompleteColumn, T
 
 DEFAULT_TIMEOUT = 3600
 DEFAULT_MAX_CONCURRENT = 5
+DEFAULT_MAX_CONCURRENT_PARTITIONS = 3
 DEFAULT_RETRIES = 3
 DEFAULT_POLL_INTERVAL = 10
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -378,6 +379,111 @@ def _wait_for_query(
         log(f"  {partition_id}  RUN    {rows:>12,}/{total:>12,} rows ({pct}) {elapsed:.0f}s")
 
 
+def _migrate_one_partition(
+    raw_host: str,
+    raw_port: int,
+    raw_user: str | None,
+    raw_password: str | None,
+    database: str,
+    dist_table: str,
+    partition_id: str,
+    insert_sql: str,
+    retries: int,
+    dry_run: bool,
+    refined_cluster: str,
+    local_table: str,
+    completed_qids: set[str],
+    log: Callable[[str], None],
+    on_partition_done: Callable[[], None] | None,
+    on_partition_status: Callable[[str, str, str], None] | None,
+) -> dict:
+    """Migrate a single partition. Returns a detail dict."""
+    qid = make_query_id(database, dist_table, partition_id)
+
+    if dry_run:
+        row_count = get_partition_row_count(
+            raw_host, raw_port, database, local_table,
+            partition_id, refined_cluster, raw_user, raw_password,
+        )
+        log(f"  {partition_id}  DRY    rows={row_count:>12,}")
+        if on_partition_done:
+            on_partition_done()
+        return {"partition_id": partition_id, "outcome": "dry_run", "rows": row_count}
+
+    # --- Resume: check local state first, then ClickHouse ---
+    if qid in completed_qids:
+        log(f"  {partition_id}  SKIP   already completed (local)")
+        if on_partition_status:
+            on_partition_status(partition_id, qid, "completed")
+        if on_partition_done:
+            on_partition_done()
+        return {"partition_id": partition_id, "outcome": "skipped", "query_id": qid}
+
+    status = check_partition_status(raw_host, raw_port, qid, raw_user, raw_password)
+
+    if status == "completed":
+        log(f"  {partition_id}  SKIP   already completed (query_log)")
+        write_partition_state(database, dist_table, partition_id, qid, "ok")
+        if on_partition_status:
+            on_partition_status(partition_id, qid, "completed")
+        if on_partition_done:
+            on_partition_done()
+        return {"partition_id": partition_id, "outcome": "skipped", "query_id": qid}
+
+    if status == "running":
+        log(f"  {partition_id}  WAIT   already running ({qid})")
+        if on_partition_status:
+            on_partition_status(partition_id, qid, "running")
+        _wait_for_query(
+            raw_host, raw_port, qid, raw_user, raw_password, log,
+            partition_id=partition_id,
+        )
+        write_partition_state(database, dist_table, partition_id, qid, "ok")
+        if on_partition_done:
+            on_partition_done()
+        return {"partition_id": partition_id, "outcome": "ok", "query_id": qid, "resumed": True}
+
+    # --- Submit new INSERT and poll for progress ---
+    if on_partition_status:
+        on_partition_status(partition_id, qid, "submitted")
+
+    for attempt in range(1, retries + 1):
+        if _shutdown:
+            break
+        try:
+            _submit_and_poll(
+                raw_host, raw_port, insert_sql,
+                query_id=qid, user=raw_user, password=raw_password,
+                log=log, partition_id=partition_id,
+            )
+            log(f"  {partition_id}  OK")
+            write_partition_state(database, dist_table, partition_id, qid, "ok")
+            if on_partition_status:
+                on_partition_status(partition_id, qid, "ok")
+            if on_partition_done:
+                on_partition_done()
+            return {"partition_id": partition_id, "outcome": "ok", "query_id": qid}
+
+        except (ClickHouseError, Exception) as e:
+            err = truncate_error(str(e))
+            if attempt < retries:
+                wait = 5 * attempt
+                log(f"  {partition_id}  RETRY  attempt {attempt}/{retries} ({err}) — waiting {wait}s")
+                time.sleep(wait)
+                continue
+            log(f"  {partition_id}  ERROR  {err} (after {retries} attempts)")
+            write_partition_state(database, dist_table, partition_id, qid, "error")
+            if on_partition_status:
+                on_partition_status(partition_id, qid, "error")
+            if on_partition_done:
+                on_partition_done()
+            return {"partition_id": partition_id, "outcome": "error", "error": err, "query_id": qid}
+
+    if on_partition_done:
+        on_partition_done()
+    return {"partition_id": partition_id, "outcome": "error", "error": "shutdown", "query_id": qid}
+
+
 def migrate_table(
     raw_host: str,
     raw_port: int,
@@ -389,6 +495,7 @@ def migrate_table(
     retries: int = DEFAULT_RETRIES,
     dry_run: bool = False,
     partition_filter: list[str] | None = None,
+    max_concurrent_partitions: int = 1,
     log: Callable[[str], None] = print,
     on_partition_done: Callable[[], None] | None = None,
     on_partition_status: Callable[[str, str, str], None] | None = None,
@@ -428,146 +535,73 @@ def migrate_table(
     # Load locally completed partitions for resume.
     completed_qids = load_completed_partitions()
 
-    # Build the SELECT column list.
+    # Build the SELECT column list and INSERT SQL template.
     col_list = ",\n    ".join(select_columns)
 
-    for partition_id in partitions:
-        if _shutdown:
-            break
-
-        qid = make_query_id(database, dist_table, partition_id)
-
-        # INSERT into raw's distributed table (has sharding key),
-        # SELECT from refined via the pre-configured refined_cluster remote server.
-        insert_sql = (
+    def make_insert_sql(partition_id: str) -> str:
+        return (
             f"INSERT INTO `{database}`.`{dist_table}`\n"
             f"SELECT\n    {col_list}\n"
             f"FROM cluster('{refined_cluster}', "
             f"'{database}', '{local_table}')\n"
             f"WHERE _partition_id = '{partition_id}'\n"
             f"SETTINGS force_primary_key = 0"
+            f", insert_distributed_sync = 1"
+            f", parallel_distributed_insert_select = 2"
+            f", max_insert_threads = 4"
+            f", max_parallel_replicas = 2"
+            f", max_block_size = 100000000"
+            f", min_insert_block_size_rows = 100000000"
+            f", min_insert_block_size_bytes = 500000000"
         )
 
-        if dry_run:
-            row_count = get_partition_row_count(
-                raw_host, raw_port, database, local_table,
-                partition_id, refined_cluster, raw_user, raw_password,
-            )
-            log(f"  {partition_id}  DRY    rows={row_count:>12,}")
-            details.append({
-                "partition_id": partition_id,
-                "outcome": "dry_run",
-                "rows": row_count,
-            })
-            if on_partition_done:
-                on_partition_done()
-            continue
-
-        # --- Resume: check local state first, then ClickHouse ---
-        if qid in completed_qids:
-            log(f"  {partition_id}  SKIP   already completed (local)")
-            results["skipped"] += 1
-            details.append({
-                "partition_id": partition_id,
-                "outcome": "skipped",
-                "query_id": qid,
-            })
-            if on_partition_status:
-                on_partition_status(partition_id, qid, "completed")
-            if on_partition_done:
-                on_partition_done()
-            continue
-
-        # Fallback: check ClickHouse for running/completed queries.
-        status = check_partition_status(
-            raw_host, raw_port, qid, raw_user, raw_password,
-        )
-
-        if status == "completed":
-            log(f"  {partition_id}  SKIP   already completed (query_log)")
-            results["skipped"] += 1
-            details.append({
-                "partition_id": partition_id,
-                "outcome": "skipped",
-                "query_id": qid,
-            })
-            # Record locally so next restart is faster.
-            write_partition_state(database, dist_table, partition_id, qid, "ok")
-            if on_partition_status:
-                on_partition_status(partition_id, qid, "completed")
-            if on_partition_done:
-                on_partition_done()
-            continue
-
-        if status == "running":
-            log(f"  {partition_id}  WAIT   already running ({qid})")
-            if on_partition_status:
-                on_partition_status(partition_id, qid, "running")
-            # Poll until the running query finishes.
-            _wait_for_query(
-                raw_host, raw_port, qid, raw_user, raw_password, log,
-                partition_id=partition_id,
-            )
-            results["ok"] += 1
-            details.append({
-                "partition_id": partition_id,
-                "outcome": "ok",
-                "query_id": qid,
-                "resumed": True,
-            })
-            write_partition_state(database, dist_table, partition_id, qid, "ok")
-            if on_partition_done:
-                on_partition_done()
-            continue
-
-        # --- Submit new INSERT and poll for progress ---
-        if on_partition_status:
-            on_partition_status(partition_id, qid, "submitted")
-
-        for attempt in range(1, retries + 1):
+    if max_concurrent_partitions <= 1:
+        # Sequential mode (original behavior).
+        for partition_id in partitions:
             if _shutdown:
                 break
-            try:
-                _submit_and_poll(
-                    raw_host, raw_port, insert_sql,
-                    query_id=qid, user=raw_user, password=raw_password,
-                    log=log, partition_id=partition_id,
-                )
-                log(f"  {partition_id}  OK")
-                results["ok"] += 1
-                details.append({
-                    "partition_id": partition_id,
-                    "outcome": "ok",
-                    "query_id": qid,
-                })
-                write_partition_state(database, dist_table, partition_id, qid, "ok")
-                if on_partition_status:
-                    on_partition_status(partition_id, qid, "ok")
-                break
+            detail = _migrate_one_partition(
+                raw_host, raw_port, raw_user, raw_password,
+                database, dist_table, partition_id,
+                make_insert_sql(partition_id), retries, dry_run,
+                refined_cluster, local_table, completed_qids,
+                log, on_partition_done, on_partition_status,
+            )
+            details.append(detail)
+            results[detail["outcome"]] = results.get(detail["outcome"], 0) + 1
+    else:
+        # Parallel partition processing.
+        import threading
+        results_lock = threading.Lock()
 
-            except (ClickHouseError, Exception) as e:
-                err = truncate_error(str(e))
-                if attempt < retries:
-                    wait = 5 * attempt
-                    log(f"  {partition_id}  RETRY  attempt {attempt}/{retries} ({err}) — waiting {wait}s")
-                    time.sleep(wait)
-                    continue
-                log(f"  {partition_id}  ERROR  {err} (after {retries} attempts)")
-                results["error"] += 1
-                details.append({
-                    "partition_id": partition_id,
-                    "outcome": "error",
-                    "error": err,
-                    "query_id": qid,
-                })
-                write_partition_state(
-                    database, dist_table, partition_id, qid, "error",
-                )
-                if on_partition_status:
-                    on_partition_status(partition_id, qid, "error")
+        def do_partition(partition_id: str) -> dict:
+            return _migrate_one_partition(
+                raw_host, raw_port, raw_user, raw_password,
+                database, dist_table, partition_id,
+                make_insert_sql(partition_id), retries, dry_run,
+                refined_cluster, local_table, completed_qids,
+                log, on_partition_done, on_partition_status,
+            )
 
-        if on_partition_done:
-            on_partition_done()
+        with ThreadPoolExecutor(max_workers=max_concurrent_partitions) as pool:
+            futures = {
+                pool.submit(do_partition, pid): pid
+                for pid in partitions
+                if not _shutdown
+            }
+            for future in as_completed(futures):
+                pid = futures[future]
+                try:
+                    detail = future.result()
+                except Exception as e:
+                    detail = {"partition_id": pid, "outcome": "error", "error": str(e)}
+                with results_lock:
+                    details.append(detail)
+                    outcome = detail["outcome"]
+                    if outcome in results:
+                        results[outcome] += 1
+                    else:
+                        results["error"] += 1
 
     return {
         "database": database,
@@ -657,6 +691,7 @@ def run_single_table(args, table_def: dict) -> None:
         retries=args.retries,
         dry_run=args.dry_run,
         partition_filter=partition_filter,
+        max_concurrent_partitions=args.max_concurrent_partitions,
     )
 
     total = sum(result[k] for k in ("ok", "skipped", "error"))
@@ -762,6 +797,7 @@ def run_multi_table(args, table_defs: list[dict]) -> None:
                 timeout=args.timeout,
                 retries=args.retries,
                 dry_run=args.dry_run,
+                max_concurrent_partitions=args.max_concurrent_partitions,
                 log=log,
                 on_partition_done=on_partition_done,
             )
@@ -842,6 +878,7 @@ def main() -> None:
     parser.add_argument("--defs", default=str(TABLES_YAML), help=f"Path to tables.yaml (default: {TABLES_YAML})")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be migrated")
     parser.add_argument("--max-concurrent", type=int, default=DEFAULT_MAX_CONCURRENT, help="Max concurrent tables")
+    parser.add_argument("--max-concurrent-partitions", type=int, default=DEFAULT_MAX_CONCURRENT_PARTITIONS, help="Max concurrent partitions per table (default: 3)")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="INSERT query timeout in seconds")
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Retry failed partitions N times")
 
