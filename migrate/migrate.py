@@ -143,8 +143,8 @@ def submit_async(
 ) -> None:
     """Submit an INSERT in a background thread. Does not block."""
     params: dict[str, str | int] = {
-        "receive_timeout": 0,
-        "send_timeout": 0,
+        "receive_timeout": 86400,
+        "send_timeout": 86400,
         "query_id": query_id,
         "wait_end_of_query": 1,
     }
