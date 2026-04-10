@@ -201,6 +201,7 @@ def get_node_partitions(
     target_disk: str = DEFAULT_DISK,
     user: str | None = None,
     password: str | None = None,
+    partition_filter: set[str] | None = None,
 ) -> list[dict]:
     """Get partitions on a single node with their disk placement.
 
@@ -246,9 +247,11 @@ def get_node_partitions(
         if row["disk_name"] == target_disk:
             p["parts_on_target"] += count
 
-    # Filter by date cutoff.
+    # Filter by partition ID and date cutoff.
     result: list[dict] = []
     for p in partitions.values():
+        if partition_filter is not None and p["partition_id"] not in partition_filter:
+            continue
         if before is not None:
             dt = extract_partition_date(p["partition"])
             if dt is None or dt >= before:
@@ -292,6 +295,7 @@ def get_node_all_partitions(
     target_disk: str = DEFAULT_DISK,
     user: str | None = None,
     password: str | None = None,
+    partition_filter: set[str] | None = None,
 ) -> list[dict]:
     """Get ALL partitions on a single node with disk status (for --status).
 
@@ -337,6 +341,8 @@ def get_node_all_partitions(
 
     result: list[dict] = []
     for p in partitions.values():
+        if partition_filter is not None and p["partition_id"] not in partition_filter:
+            continue
         if before is not None:
             dt = extract_partition_date(p["partition"])
             if dt is None or dt >= before:
@@ -586,11 +592,13 @@ def tier_table_on_node(
     dry_run: bool = False,
     log: Callable[[str], None] = print,
     on_partition_done: Callable[[], None] | None = None,
+    partition_filter: set[str] | None = None,
 ) -> dict:
     """Move all eligible partitions of a table to target disk on one node."""
     # Discover partitions needing move.
     partitions = get_node_partitions(
         node_host, node_port, database, table, cutoff, target_disk, user, password,
+        partition_filter,
     )
 
     # Discover partitions currently being moved.
@@ -732,6 +740,7 @@ def show_status(
     target_disk: str,
     user: str | None,
     password: str | None,
+    partition_filter: set[str] | None = None,
 ) -> None:
     """Show partition disk placement per node."""
     for table in tables:
@@ -745,7 +754,7 @@ def show_status(
             name = node_names.get(node_host, node_host)
             parts = get_node_all_partitions(
                 node_host, node_port, local_db, local_table,
-                cutoff, target_disk, user, password,
+                cutoff, target_disk, user, password, partition_filter,
             )
             if not parts:
                 print(f"  [{name}] no partitions")
@@ -772,6 +781,7 @@ def show_dry_run(
     target_disk: str,
     user: str | None,
     password: str | None,
+    partition_filter: set[str] | None = None,
 ) -> None:
     """Preview what would be moved."""
     grand_total = 0
@@ -787,7 +797,7 @@ def show_dry_run(
             name = node_names.get(node_host, node_host)
             parts = get_node_partitions(
                 node_host, node_port, local_db, local_table,
-                cutoff, target_disk, user, password,
+                cutoff, target_disk, user, password, partition_filter,
             )
             moving = get_node_moving_partitions(
                 node_host, node_port, local_db, local_table, user, password,
@@ -822,6 +832,7 @@ def run_tiering(
     nodes: list[tuple[str, int]],
     node_names: dict[str, str],
     cutoff: datetime | None,
+    partition_filter: set[str] | None = None,
 ) -> None:
     import threading
 
@@ -845,6 +856,7 @@ def run_tiering(
             parts = get_node_partitions(
                 node_host, node_port, local_db, local_table,
                 cutoff, target_disk, args.user, args.password,
+                partition_filter,
             )
             moving = get_node_moving_partitions(
                 node_host, node_port, local_db, local_table,
@@ -948,6 +960,7 @@ def run_tiering(
                 dry_run=False,
                 log=log,
                 on_partition_done=on_partition_done,
+                partition_filter=partition_filter,
             )
 
             m = result["moved"]
@@ -1042,6 +1055,8 @@ def main() -> None:
                         help=f"Cluster name for node discovery (default: {DEFAULT_CLUSTER})")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be moved")
     parser.add_argument("--status", action="store_true", help="Show partition disk placement")
+    parser.add_argument("--partition", nargs="+", default=None,
+                        help="Only process these partition IDs (space-separated)")
     parser.add_argument("--all-partitions", action="store_true",
                         help="Include all partitions (ignore date filter)")
     parser.add_argument("--max-concurrent", type=int, default=DEFAULT_MAX_CONCURRENT,
@@ -1059,6 +1074,11 @@ def main() -> None:
         _secure = True
     if args.port is None:
         args.port = 443 if _secure else 8123
+
+    partition_filter: set[str] | None = None
+    if args.partition:
+        partition_filter = set(args.partition)
+        print(f"Partition filter: {', '.join(sorted(partition_filter))}")
 
     cutoff: datetime | None = None
     if not args.all_partitions:
@@ -1094,7 +1114,7 @@ def main() -> None:
         show_status(
             probe_host, args.port, nodes, node_names,
             args.database, args.table, cutoff, args.disk,
-            args.user, args.password,
+            args.user, args.password, partition_filter,
         )
         return
 
@@ -1102,11 +1122,11 @@ def main() -> None:
         show_dry_run(
             probe_host, args.port, nodes, node_names,
             args.database, args.table, cutoff, args.disk,
-            args.user, args.password,
+            args.user, args.password, partition_filter,
         )
         return
 
-    run_tiering(args, nodes, node_names, cutoff)
+    run_tiering(args, nodes, node_names, cutoff, partition_filter)
 
 
 if __name__ == "__main__":

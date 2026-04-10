@@ -557,6 +557,13 @@ def poll_optimize_done(
             if no_merge_cycles >= 3:
                 if on_merge_progress:
                     on_merge_progress(partition_id, None)
+                if current > num_nodes:
+                    raise ClickHouseError(
+                        f"OPTIMIZE had no effect on partition {partition_id}: "
+                        f"still {current} parts (expected {num_nodes}). "
+                        f"Merge may be blocked by low dynamic merge size limit "
+                        f"(check background pool usage)."
+                    )
                 return current
         else:
             no_merge_cycles = 0
