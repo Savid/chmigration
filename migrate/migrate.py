@@ -175,26 +175,46 @@ def check_partition_status(
     host: str,
     port: int,
     query_id: str,
+    cluster: str,
     user: str | None = None,
     password: str | None = None,
 ) -> str:
     """Check if a migration query already ran or is running.
 
+    Uses clusterAllReplicas to check ALL nodes, not just the node the load
+    balancer routes to. This is critical with parallel_distributed_insert_select=2
+    where sub-queries on individual shards can log QueryFinish even when the
+    overall query failed on another shard.
+
     Returns: "completed", "running", or "none".
     """
-    # Check system.processes first (is it running right now?).
+    # Check system.processes across all nodes first (is it running right now?).
     running = query_json_rows(
         host, port,
-        f"SELECT query_id FROM system.processes WHERE query_id = '{query_id}'",
+        f"SELECT query_id FROM clusterAllReplicas('{cluster}', system.processes) "
+        f"WHERE query_id = '{query_id}' LIMIT 1",
         timeout=10, user=user, password=password,
     )
     if running:
         return "running"
 
-    # Check query_log for successful completion (type=QueryFinish, exception_code=0).
+    # Check query_log across ALL nodes. If ANY node has an exception for this
+    # query_id, the migration is not complete — even if other nodes succeeded
+    # their sub-queries.
+    has_failure = query_json_rows(
+        host, port,
+        f"SELECT query_id FROM clusterAllReplicas('{cluster}', system.query_log) "
+        f"WHERE query_id = '{query_id}' AND type = 'ExceptionWhileProcessing' "
+        f"LIMIT 1",
+        timeout=10, user=user, password=password,
+    )
+    if has_failure:
+        return "none"
+
+    # Only mark completed if at least one node has QueryFinish with no errors.
     finished = query_json_rows(
         host, port,
-        f"SELECT query_id FROM system.query_log "
+        f"SELECT query_id FROM clusterAllReplicas('{cluster}', system.query_log) "
         f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND exception_code = 0 "
         f"LIMIT 1",
         timeout=10, user=user, password=password,
@@ -356,6 +376,7 @@ def _wait_for_query(
     user: str | None,
     password: str | None,
     log: Callable[[str], None],
+    cluster: str = "replicated",
     partition_id: str = "",
     poll_interval: int = DEFAULT_POLL_INTERVAL,
 ) -> None:
@@ -365,7 +386,7 @@ def _wait_for_query(
         progress = get_running_progress(host, port, [query_id], user, password)
         if query_id not in progress:
             # Query is no longer in processes — check if it succeeded.
-            status = check_partition_status(host, port, query_id, user, password)
+            status = check_partition_status(host, port, query_id, cluster, user, password)
             if status == "completed":
                 log(f"  {partition_id}  OK     (resumed)")
                 return
@@ -391,6 +412,7 @@ def _migrate_one_partition(
     retries: int,
     dry_run: bool,
     refined_cluster: str,
+    raw_cluster: str,
     local_table: str,
     completed_qids: set[str],
     log: Callable[[str], None],
@@ -419,7 +441,7 @@ def _migrate_one_partition(
             on_partition_done()
         return {"partition_id": partition_id, "outcome": "skipped", "query_id": qid}
 
-    status = check_partition_status(raw_host, raw_port, qid, raw_user, raw_password)
+    status = check_partition_status(raw_host, raw_port, qid, raw_cluster, raw_user, raw_password)
 
     if status == "completed":
         log(f"  {partition_id}  SKIP   already completed (query_log)")
@@ -436,7 +458,7 @@ def _migrate_one_partition(
             on_partition_status(partition_id, qid, "running")
         _wait_for_query(
             raw_host, raw_port, qid, raw_user, raw_password, log,
-            partition_id=partition_id,
+            cluster=raw_cluster, partition_id=partition_id,
         )
         write_partition_state(database, dist_table, partition_id, qid, "ok")
         if on_partition_done:
@@ -490,6 +512,7 @@ def migrate_table(
     raw_user: str | None,
     raw_password: str | None,
     refined_cluster: str,
+    raw_cluster: str,
     table_def: dict,
     timeout: int = DEFAULT_TIMEOUT,
     retries: int = DEFAULT_RETRIES,
@@ -564,7 +587,7 @@ def migrate_table(
                 raw_host, raw_port, raw_user, raw_password,
                 database, dist_table, partition_id,
                 make_insert_sql(partition_id), retries, dry_run,
-                refined_cluster, local_table, completed_qids,
+                refined_cluster, raw_cluster, local_table, completed_qids,
                 log, on_partition_done, on_partition_status,
             )
             details.append(detail)
@@ -579,7 +602,7 @@ def migrate_table(
                 raw_host, raw_port, raw_user, raw_password,
                 database, dist_table, partition_id,
                 make_insert_sql(partition_id), retries, dry_run,
-                refined_cluster, local_table, completed_qids,
+                refined_cluster, raw_cluster, local_table, completed_qids,
                 log, on_partition_done, on_partition_status,
             )
 
@@ -686,6 +709,7 @@ def run_single_table(args, table_def: dict) -> None:
         raw_user=args.user,
         raw_password=args.password,
         refined_cluster=args.refined_cluster,
+        raw_cluster=args.raw_cluster,
         table_def=table_def,
         timeout=args.timeout,
         retries=args.retries,
@@ -793,6 +817,7 @@ def run_multi_table(args, table_defs: list[dict]) -> None:
                 raw_user=args.user,
                 raw_password=args.password,
                 refined_cluster=args.refined_cluster,
+                raw_cluster=args.raw_cluster,
                 table_def=td,
                 timeout=args.timeout,
                 retries=args.retries,
@@ -868,6 +893,7 @@ def main() -> None:
 
     # Refined cluster (source) — uses pre-configured remote server on raw.
     parser.add_argument("--refined-cluster", default="refined_cluster", help="Remote cluster name for refined source (default: refined_cluster)")
+    parser.add_argument("--raw-cluster", default="replicated", help="Local cluster name for raw (used for resume checks across all nodes, default: replicated)")
 
     # Table selection.
     parser.add_argument("--database", required=True, help="Database name")
