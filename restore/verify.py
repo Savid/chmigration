@@ -35,6 +35,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -53,6 +54,7 @@ from rich.progress import Progress, TextColumn, BarColumn, MofNCompleteColumn, T
 DEFAULT_CLUSTER = "replicated"
 DEFAULT_TIMEOUT = 3600
 DEFAULT_MAX_CONCURRENT = 5
+DEFAULT_MAX_CONCURRENT_PARTITIONS = 1
 DEFAULT_RETRIES = 3
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPORT_LOG = SCRIPT_DIR / "verify.jsonl"
@@ -231,6 +233,22 @@ def get_all_partitions(
 # Per-partition verification
 # ---------------------------------------------------------------------------
 
+def _partition_where(partition_id: str, filter_column: str | None) -> str:
+    """Build the WHERE clause for a partition.
+
+    When *filter_column* is None (default), filters by the physical
+    _partition_id virtual column. When set, derives the YYYYMM month from
+    the leading 6 digits of *partition_id* and filters by
+    toYYYYMM(<column>) = YYYYMM — which works across clusters that have
+    different PARTITION BY expressions (e.g., xatu's month-string partitions
+    vs raw's hash-based partitions after migration).
+    """
+    if filter_column:
+        yyyymm = partition_id[:6]
+        return f"toYYYYMM(`{filter_column}`) = {int(yyyymm)}"
+    return f"_partition_id = '{partition_id}'"
+
+
 def hash_partition(
     host: str,
     port: int,
@@ -241,6 +259,7 @@ def hash_partition(
     user: str | None = None,
     password: str | None = None,
     use_final: bool = False,
+    filter_column: str | None = None,
 ) -> dict:
     """Compute row count + content hash for a single partition.
 
@@ -250,10 +269,11 @@ def hash_partition(
     Returns dict with keys: count, hash. Hash is None if partition is empty.
     """
     final = " FINAL" if use_final else ""
+    where = _partition_where(partition_id, filter_column)
     sql = (
         f"SELECT count() AS cnt, groupBitXor(cityHash64(*)) AS hash "
         f"FROM `{database}`.`{table}`{final} "
-        f"WHERE _partition_id = '{partition_id}'"
+        f"WHERE {where}"
     )
     rows = query_json_rows(host, port, sql, timeout=timeout, user=user, password=password)
     if not rows:
@@ -276,13 +296,15 @@ def count_partition(
     user: str | None = None,
     password: str | None = None,
     use_final: bool = False,
+    filter_column: str | None = None,
 ) -> int:
     """Row count for a partition. Uses the Distributed table for cluster-wide view."""
     final = " FINAL" if use_final else ""
+    where = _partition_where(partition_id, filter_column)
     sql = (
         f"SELECT count() AS cnt "
         f"FROM `{database}`.`{table}`{final} "
-        f"WHERE _partition_id = '{partition_id}'"
+        f"WHERE {where}"
     )
     rows = query_json_rows(host, port, sql, timeout=30, user=user, password=password)
     return int(rows[0].get("cnt", 0)) if rows else 0
@@ -325,6 +347,8 @@ def verify_table(
     counts_only: bool = False,
     hash_timeout: int = DEFAULT_TIMEOUT,
     retries: int = DEFAULT_RETRIES,
+    filter_column: str | None = None,
+    max_concurrent_partitions: int = 1,
     log: Callable[[str], None] = print,
     on_partition_done: Callable[[], None] | None = None,
 ) -> dict:
@@ -362,31 +386,40 @@ def verify_table(
             "partition_detail": [],
         }
 
-    # Check which partitions actually exist on target (use local table + system.parts).
-    target_partitions = set(get_all_partitions(
-        target_host, target_port, local_db, local_table,
-        target_cluster, target_user, target_password,
-    ))
+    # Pre-check target partitions only when matching by physical _partition_id.
+    # When filter_column is set we're comparing via toYYYYMM(col) — target's
+    # partition_ids are allowed to differ from source's (e.g., when PARTITION
+    # BY expressions diverge across clusters), so skip this check.
+    if filter_column:
+        target_partitions: set[str] | None = None
+    else:
+        target_partitions = set(get_all_partitions(
+            target_host, target_port, local_db, local_table,
+            target_cluster, target_user, target_password,
+        ))
 
-    for bk in backups:
+    results_lock = threading.Lock()
+
+    def handle_partition(bk: dict) -> None:
         if _shutdown:
-            break
+            return
 
         partition_id = bk["partition_id"]
 
         # Quick check: does the partition exist on target at all?
-        if partition_id not in target_partitions:
+        if target_partitions is not None and partition_id not in target_partitions:
             log(f"  {partition_id}  MISSING")
-            results["missing"] += 1
-            details.append({
-                "partition_id": partition_id,
-                "outcome": "missing",
-                "source_count": None,
-                "target_count": None,
-            })
+            with results_lock:
+                results["missing"] += 1
+                details.append({
+                    "partition_id": partition_id,
+                    "outcome": "missing",
+                    "source_count": None,
+                    "target_count": None,
+                })
             if on_partition_done:
                 on_partition_done()
-            continue
+            return
 
         for attempt in range(1, retries + 1):
             try:
@@ -394,31 +427,35 @@ def verify_table(
                     src_count = count_partition(
                         source_host, source_port, source_database, query_table,
                         partition_id, use_final=use_final,
+                        filter_column=filter_column,
                     )
                     tgt_count = count_partition(
                         target_host, target_port, source_database, query_table,
                         partition_id, user=target_user, password=target_password,
                         use_final=use_final,
+                        filter_column=filter_column,
                     )
                     if src_count == tgt_count:
                         log(f"  {partition_id}  OK     rows={src_count:>12,}")
-                        results["ok"] += 1
-                        details.append({
-                            "partition_id": partition_id,
-                            "outcome": "ok",
-                            "source_count": src_count,
-                            "target_count": tgt_count,
-                        })
+                        with results_lock:
+                            results["ok"] += 1
+                            details.append({
+                                "partition_id": partition_id,
+                                "outcome": "ok",
+                                "source_count": src_count,
+                                "target_count": tgt_count,
+                            })
                     else:
                         diff = tgt_count - src_count
                         log(f"  {partition_id}  ROWS   source={src_count:>12,}  target={tgt_count:>12,}  diff={diff:+,}")
-                        results["row_diff"] += 1
-                        details.append({
-                            "partition_id": partition_id,
-                            "outcome": "row_diff",
-                            "source_count": src_count,
-                            "target_count": tgt_count,
-                        })
+                        with results_lock:
+                            results["row_diff"] += 1
+                            details.append({
+                                "partition_id": partition_id,
+                                "outcome": "row_diff",
+                                "source_count": src_count,
+                                "target_count": tgt_count,
+                            })
                 else:
                     # Full hash comparison — run source and target in parallel.
                     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -427,6 +464,7 @@ def verify_table(
                             source_host, source_port, source_database, query_table,
                             partition_id, timeout=hash_timeout,
                             use_final=use_final,
+                            filter_column=filter_column,
                         )
                         tgt_future = pool.submit(
                             hash_partition,
@@ -434,6 +472,7 @@ def verify_table(
                             partition_id, timeout=hash_timeout,
                             user=target_user, password=target_password,
                             use_final=use_final,
+                            filter_column=filter_column,
                         )
                         src = src_future.result()
                         tgt = tgt_future.result()
@@ -445,38 +484,41 @@ def verify_table(
 
                     if src_count == tgt_count and src_hash == tgt_hash:
                         log(f"  {partition_id}  OK     rows={src_count:>12,}  hash={src_hash}")
-                        results["ok"] += 1
-                        details.append({
-                            "partition_id": partition_id,
-                            "outcome": "ok",
-                            "source_count": src_count,
-                            "target_count": tgt_count,
-                            "source_hash": src_hash,
-                            "target_hash": tgt_hash,
-                        })
+                        with results_lock:
+                            results["ok"] += 1
+                            details.append({
+                                "partition_id": partition_id,
+                                "outcome": "ok",
+                                "source_count": src_count,
+                                "target_count": tgt_count,
+                                "source_hash": src_hash,
+                                "target_hash": tgt_hash,
+                            })
                     elif src_count != tgt_count:
                         diff = tgt_count - src_count
                         log(f"  {partition_id}  ROWS   source={src_count:>12,}  target={tgt_count:>12,}  diff={diff:+,}")
-                        results["row_diff"] += 1
-                        details.append({
-                            "partition_id": partition_id,
-                            "outcome": "row_diff",
-                            "source_count": src_count,
-                            "target_count": tgt_count,
-                            "source_hash": src_hash,
-                            "target_hash": tgt_hash,
-                        })
+                        with results_lock:
+                            results["row_diff"] += 1
+                            details.append({
+                                "partition_id": partition_id,
+                                "outcome": "row_diff",
+                                "source_count": src_count,
+                                "target_count": tgt_count,
+                                "source_hash": src_hash,
+                                "target_hash": tgt_hash,
+                            })
                     else:
                         log(f"  {partition_id}  HASH   rows={src_count:>12,}  src_hash={src_hash}  tgt_hash={tgt_hash}")
-                        results["hash_diff"] += 1
-                        details.append({
-                            "partition_id": partition_id,
-                            "outcome": "hash_diff",
-                            "source_count": src_count,
-                            "target_count": tgt_count,
-                            "source_hash": src_hash,
-                            "target_hash": tgt_hash,
-                        })
+                        with results_lock:
+                            results["hash_diff"] += 1
+                            details.append({
+                                "partition_id": partition_id,
+                                "outcome": "hash_diff",
+                                "source_count": src_count,
+                                "target_count": tgt_count,
+                                "source_hash": src_hash,
+                                "target_hash": tgt_hash,
+                            })
                 break  # success — no retry needed
 
             except (ClickHouseError, Exception) as e:
@@ -487,15 +529,22 @@ def verify_table(
                     time.sleep(wait)
                     continue
                 log(f"  {partition_id}  ERROR  {err} (after {retries} attempts)")
-                results["error"] += 1
-                details.append({
-                    "partition_id": partition_id,
-                    "outcome": "error",
-                    "error": err,
-                })
+                with results_lock:
+                    results["error"] += 1
+                    details.append({
+                        "partition_id": partition_id,
+                        "outcome": "error",
+                        "error": err,
+                    })
 
         if on_partition_done:
             on_partition_done()
+
+    workers = max(1, max_concurrent_partitions)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(handle_partition, bk) for bk in backups]
+        for f in as_completed(futures):
+            f.result()
 
     return {
         "database": local_db,
@@ -556,6 +605,8 @@ def run_single_table(args, target_cluster: str | None, source_cluster: str | Non
         counts_only=args.counts_only,
         hash_timeout=args.timeout,
         retries=args.retries,
+        filter_column=args.filter_column,
+        max_concurrent_partitions=args.max_concurrent_partitions,
     )
 
     total = sum(result[k] for k in ("ok", "row_diff", "hash_diff", "missing", "error"))
@@ -666,6 +717,8 @@ def run_multi_table(args, target_cluster: str | None, source_cluster: str | None
                 counts_only=args.counts_only,
                 hash_timeout=args.timeout,
                 retries=args.retries,
+                filter_column=args.filter_column,
+                max_concurrent_partitions=args.max_concurrent_partitions,
                 log=log,
                 on_partition_done=on_partition_done,
             )
@@ -737,8 +790,29 @@ def main() -> None:
     parser.add_argument("--source-cluster", default=DEFAULT_CLUSTER, help=f"Source cluster name (default: {DEFAULT_CLUSTER})")
     parser.add_argument("--counts-only", action="store_true", help="Only compare row counts (skip hashing — much faster)")
     parser.add_argument(
+        "--filter-column",
+        default=None,
+        metavar="COLUMN",
+        help=(
+            "Filter by toYYYYMM(COLUMN) instead of _partition_id. Use when "
+            "source and target have different PARTITION BY expressions (e.g., "
+            "xatu's month-string partitions vs raw's hash partitions after "
+            "migration). COLUMN must be a Date/DateTime column present on both "
+            "sides — commonly the primary key's date component."
+        ),
+    )
+    parser.add_argument(
         "--max-concurrent", type=int, default=DEFAULT_MAX_CONCURRENT,
         help=f"Max tables to verify concurrently (default: {DEFAULT_MAX_CONCURRENT})",
+    )
+    parser.add_argument(
+        "--max-concurrent-partitions", type=int, default=DEFAULT_MAX_CONCURRENT_PARTITIONS,
+        help=(
+            f"Max partitions to verify concurrently per table "
+            f"(default: {DEFAULT_MAX_CONCURRENT_PARTITIONS}). Total in-flight "
+            f"verifies = --max-concurrent * --max-concurrent-partitions, and "
+            f"hash mode doubles that since source+target are queried in parallel."
+        ),
     )
     parser.add_argument(
         "--timeout", type=int, default=DEFAULT_TIMEOUT,

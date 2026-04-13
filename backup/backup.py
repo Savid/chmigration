@@ -37,6 +37,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -60,6 +61,7 @@ DEFAULT_DISK = "s3_backup"
 DEFAULT_CLUSTER = "replicated"
 DEFAULT_TIMEOUT = 3600
 DEFAULT_MAX_CONCURRENT = 5
+DEFAULT_MAX_CONCURRENT_PARTITIONS = 1
 SCRIPT_DIR = Path(__file__).resolve().parent
 STATE_LOG = SCRIPT_DIR / "state.jsonl"
 
@@ -268,6 +270,14 @@ def check_backup_status(
 
     When *cluster* is set, queries across all replicas via clusterAllReplicas().
 
+    Priority order (matters when multiple rows exist for the same path):
+      1. CREATING_BACKUP — if any replica is actively backing up, we must wait.
+         Otherwise a stale BACKUP_FAILED row from an earlier collision could
+         look "newer" than an in-flight attempt and trigger another retry,
+         which would hit BACKUP_ALREADY_EXISTS.
+      2. BACKUP_CREATED (most recent) — done.
+      3. BACKUP_FAILED (most recent) — caller may retry.
+
     Returns (status, row) or (None, None) when no matching backup exists.
     """
     source = (
@@ -276,13 +286,28 @@ def check_backup_status(
         else "system.backups"
     )
     safe_path = backup_path.replace("'", "\\'")
-    sql = (
+    common_select = (
         "SELECT id, name, status, error, "
         "  start_time, end_time, num_files, "
         "  total_size, compressed_size "
         f"FROM {source} "
         f"WHERE name LIKE '%{safe_path}%' "
-        "ORDER BY start_time DESC LIMIT 1"
+    )
+
+    # 1. Any active backup blocks re-issue.
+    sql = common_select + "AND status = 'CREATING_BACKUP' ORDER BY start_time DESC LIMIT 1"
+    try:
+        rows = query_json_rows(host, port, sql, timeout=30)
+    except ClickHouseError:
+        return None, None
+    if rows:
+        return rows[0].get("status"), rows[0]
+
+    # 2. Terminal status — prefer CREATED over FAILED, then most recent.
+    sql = (
+        common_select
+        + "AND status IN ('BACKUP_CREATED', 'BACKUP_FAILED') "
+        + "ORDER BY status = 'BACKUP_CREATED' DESC, start_time DESC LIMIT 1"
     )
     try:
         rows = query_json_rows(host, port, sql, timeout=30)
@@ -357,11 +382,22 @@ def backup_table(
     cutoff: datetime | None,
     disk: str,
     cluster: str | None,
+    force_partitions: set[str] | None = None,
+    max_concurrent_partitions: int = 1,
     log: Callable[[str], None] = print,
     on_partition_done: Callable[[], None] | None = None,
     on_bytes_created: Callable[[int], None] | None = None,
 ) -> dict:
     """Back up all eligible partitions of a single table.
+
+    Partitions run concurrently up to *max_concurrent_partitions*; setting it
+    to 1 preserves the original sequential behavior.
+
+    When *force_partitions* is non-empty, the run is restricted to those
+    partition IDs, the date cutoff is ignored, and the idempotency check is
+    bypassed so the backup is re-issued even if a BACKUP_CREATED row exists
+    in system.backups. Callers must delete the S3 backup files first or
+    ClickHouse will error "backup already exists".
 
     Returns a results dict with keys: database, table, source_table, created,
     skipped, in_progress, failed, partition_detail.
@@ -370,10 +406,18 @@ def backup_table(
     if is_distributed:
         log(f"  {source_database}.{source_table} -> {local_db}.{local_table}")
 
-    partitions = get_partitions(host, port, local_db, local_table, cutoff, cluster)
+    effective_cutoff = None if force_partitions else cutoff
+    partitions = get_partitions(host, port, local_db, local_table, effective_cutoff, cluster)
+    if force_partitions:
+        partitions = [p for p in partitions if p["partition_id"] in force_partitions]
+        found = {p["partition_id"] for p in partitions}
+        missing = sorted(force_partitions - found)
+        if missing:
+            log(f"  WARNING: force-partition not found in source system.parts: {missing}")
 
     results = {"created": 0, "skipped": 0, "in_progress": 0, "failed": 0}
     partition_outcomes: dict[str, str] = {}
+    results_lock = threading.Lock()
 
     if not partitions:
         return {
@@ -384,54 +428,65 @@ def backup_table(
             "partition_detail": [],
         }
 
-    for p in partitions:
+    def handle_partition(p: dict) -> None:
         if _shutdown:
-            break
+            return
 
         partition = p["partition"]
         partition_id = p["partition_id"]
         path = make_backup_path(local_db, local_table, partition_id)
 
-        # Idempotency check.
+        force = bool(force_partitions) and partition_id in force_partitions
         status, info = check_backup_status(host, port, path, cluster)
 
         if status == "BACKUP_CREATED":
-            results["skipped"] += 1
-            partition_outcomes[partition_id] = "skipped"
-            if on_partition_done:
-                on_partition_done()
-            continue
+            if force:
+                # Drop through to issue a new backup; existing BACKUP_CREATED
+                # row ignored. Caller must have cleared the S3 destination.
+                log(f"  {partition} force re-backup (ignoring previous BACKUP_CREATED)")
+                status, info = None, None
+            else:
+                log(f"  {partition} already backed up — skipping")
+                with results_lock:
+                    results["skipped"] += 1
+                    partition_outcomes[partition_id] = "skipped"
+                if on_partition_done:
+                    on_partition_done()
+                return
 
         if status == "CREATING_BACKUP":
-            # Previous run's backup is still going — wait for it.
-            log(f"  Waiting for in-progress backup of {partition}...")
+            # Always wait for in-flight backups, even under --force: issuing a
+            # second BACKUP to the same destination would hit BACKUP_ALREADY_EXISTS.
+            log(f"  {partition} waiting for in-progress backup...")
             while not _shutdown:
                 time.sleep(POLL_INTERVAL)
                 status, info = check_backup_status(host, port, path, cluster)
                 if status != "CREATING_BACKUP":
                     break
             if _shutdown:
-                break
+                return
             if status == "BACKUP_CREATED":
                 backed_bytes = int(info.get("total_size", 0)) if info else 0
                 log(f"  {partition} completed -> {format_size(backed_bytes)}")
-                results["created"] += 1
-                partition_outcomes[partition_id] = "created"
+                with results_lock:
+                    results["created"] += 1
+                    partition_outcomes[partition_id] = "created"
                 if on_bytes_created:
                     on_bytes_created(backed_bytes)
             else:
                 err = info.get("error", "unknown") if info else "unknown"
                 log(f"  {partition} FAILED after wait: {err}")
-                results["failed"] += 1
-                partition_outcomes[partition_id] = "failed"
+                with results_lock:
+                    results["failed"] += 1
+                    partition_outcomes[partition_id] = "failed"
             if on_partition_done:
                 on_partition_done()
-            continue
+            return
 
         if status == "BACKUP_FAILED":
-            log(f"  Retrying failed partition {partition}")
+            log(f"  {partition} retrying after previous failure")
 
-        # Run async backup + poll.
+        log(f"  {partition} issuing BACKUP...")
         try:
             bk_status, bk_info = do_backup_partition(
                 host, port, local_db, local_table,
@@ -439,30 +494,41 @@ def backup_table(
             )
             if bk_status == "BACKUP_CREATED":
                 backed_bytes = int(bk_info.get("total_size", 0)) if bk_info else 0
-                log(f"  {partition} -> {format_size(backed_bytes)}")
-                results["created"] += 1
-                partition_outcomes[partition_id] = "created"
+                log(f"  {partition} backed up -> {format_size(backed_bytes)}")
+                with results_lock:
+                    results["created"] += 1
+                    partition_outcomes[partition_id] = "created"
                 if on_bytes_created:
                     on_bytes_created(backed_bytes)
             elif bk_status == "INTERRUPTED":
-                break
+                return
             else:
                 err = bk_info.get("error", "unknown") if bk_info else "unknown"
                 log(f"  {partition} FAILED: {err}")
-                results["failed"] += 1
-                partition_outcomes[partition_id] = "failed"
+                with results_lock:
+                    results["failed"] += 1
+                    partition_outcomes[partition_id] = "failed"
         except ClickHouseError as e:
             msg = str(e).lower()
             if "already exists" in msg or "backup_already_exists" in msg:
-                results["skipped"] += 1
-                partition_outcomes[partition_id] = "skipped"
+                log(f"  {partition} destination occupied in S3 — skipping")
+                with results_lock:
+                    results["skipped"] += 1
+                    partition_outcomes[partition_id] = "skipped"
             else:
                 log(f"  {partition} ERROR: {e}")
-                results["failed"] += 1
-                partition_outcomes[partition_id] = "failed"
+                with results_lock:
+                    results["failed"] += 1
+                    partition_outcomes[partition_id] = "failed"
 
         if on_partition_done:
             on_partition_done()
+
+    workers = max(1, max_concurrent_partitions)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(handle_partition, p) for p in partitions]
+        for f in as_completed(futures):
+            f.result()
 
     return {
         "database": local_db,
@@ -632,7 +698,15 @@ def run_single_table(args, cluster: str | None, cutoff: datetime | None) -> None
     else:
         print(f"Local table: {local_db}.{local_table}")
 
-    partitions = get_partitions(args.host, args.port, local_db, local_table, cutoff, cluster)
+    force_partitions: set[str] = set(args.force_partition) if args.force_partition else set()
+    effective_cutoff = None if force_partitions else cutoff
+    partitions = get_partitions(args.host, args.port, local_db, local_table, effective_cutoff, cluster)
+    if force_partitions:
+        partitions = [p for p in partitions if p["partition_id"] in force_partitions]
+        found = {p["partition_id"] for p in partitions}
+        missing = sorted(force_partitions - found)
+        if missing:
+            print(f"WARNING: force-partition not found in source system.parts: {missing}")
     if not partitions:
         print("No partitions found matching criteria")
         return
@@ -640,6 +714,36 @@ def run_single_table(args, cluster: str | None, cutoff: datetime | None) -> None
     total_rows = sum(int(p.get("rows", 0)) for p in partitions)
     total_bytes = sum(int(p.get("bytes", 0)) for p in partitions)
     print(f"Found {len(partitions)} partition(s): {total_rows:,} rows, {format_size(total_bytes)}")
+    if force_partitions:
+        print(f"Force re-backup mode: {sorted(force_partitions)} (idempotency check bypassed)")
+
+    # Concurrent path: delegate to backup_table (no per-partition polling dots,
+    # but partitions run in parallel up to --max-concurrent-partitions).
+    if args.max_concurrent_partitions > 1:
+        print(f"Backing up up to {args.max_concurrent_partitions} partitions concurrently\n")
+        result = backup_table(
+            host=args.host,
+            port=args.port,
+            source_database=args.database,
+            source_table=table,
+            cutoff=cutoff,
+            disk=args.disk,
+            cluster=cluster,
+            force_partitions=force_partitions or None,
+            max_concurrent_partitions=args.max_concurrent_partitions,
+        )
+        total = result["created"] + result["skipped"] + result["in_progress"] + result["failed"]
+        print(f"\n{'=' * 60}")
+        print(f"Backup complete: {local_db}.{local_table}")
+        print(f"  Created:      {result['created']:>4} / {total}")
+        print(f"  Skipped:      {result['skipped']:>4} (already backed up)")
+        print(f"  In progress:  {result['in_progress']:>4}")
+        print(f"  Failed:       {result['failed']:>4}")
+        write_state_log(result, cutoff, args.host, cluster, args.disk)
+        print(f"  State log:    {STATE_LOG}")
+        if result["failed"] > 0:
+            sys.exit(1)
+        return
 
     results = {"created": 0, "skipped": 0, "in_progress": 0, "failed": 0}
     partition_outcomes: dict[str, str] = {}
@@ -659,14 +763,19 @@ def run_single_table(args, cluster: str | None, cutoff: datetime | None) -> None
 
         print(f"\n[{i}/{len(partitions)}] {partition} ({rows:,} rows, {size})")
 
+        force = partition_id in force_partitions
         status, info = check_backup_status(args.host, args.port, path, cluster)
 
         if status == "BACKUP_CREATED":
-            bk_size = format_size(int(info.get("total_size", 0)))
-            print(f"  Already backed up ({info.get('num_files', '?')} files, {bk_size})")
-            results["skipped"] += 1
-            partition_outcomes[partition_id] = "skipped"
-            continue
+            if force:
+                print("  Force re-backup — ignoring previous BACKUP_CREATED row")
+                status, info = None, None
+            else:
+                bk_size = format_size(int(info.get("total_size", 0)))
+                print(f"  Already backed up ({info.get('num_files', '?')} files, {bk_size})")
+                results["skipped"] += 1
+                partition_outcomes[partition_id] = "skipped"
+                continue
 
         if status == "CREATING_BACKUP":
             started = info.get("start_time", "?") if info else "?"
@@ -886,6 +995,8 @@ def run_multi_table(args, cluster: str | None, cutoff: datetime | None) -> None:
                 cutoff=cutoff,
                 disk=args.disk,
                 cluster=cluster,
+                force_partitions=set(args.force_partition) if args.force_partition else None,
+                max_concurrent_partitions=args.max_concurrent_partitions,
                 log=log,
                 on_partition_done=on_partition_done,
                 on_bytes_created=on_bytes_created,
@@ -972,8 +1083,28 @@ def main() -> None:
     parser.add_argument("--verify", action="store_true", help="Verify backups: compare system.backups sizes vs system.parts")
     parser.add_argument("--all-partitions", action="store_true", help="Include all partitions (ignore date filter)")
     parser.add_argument(
+        "--force-partition",
+        nargs="+",
+        metavar="PARTITION_ID",
+        help=(
+            "Force re-backup of specific partition IDs (e.g. 20260201). "
+            "Filters to just these partitions, ignores --before/--all-partitions, "
+            "and bypasses the system.backups idempotency check. "
+            "IMPORTANT: delete the existing S3 backup objects first, or "
+            "ClickHouse will error 'backup already exists'."
+        ),
+    )
+    parser.add_argument(
         "--max-concurrent", type=int, default=DEFAULT_MAX_CONCURRENT,
         help=f"Max tables to back up concurrently (default: {DEFAULT_MAX_CONCURRENT})",
+    )
+    parser.add_argument(
+        "--max-concurrent-partitions", type=int, default=DEFAULT_MAX_CONCURRENT_PARTITIONS,
+        help=(
+            f"Max partitions to back up concurrently per table "
+            f"(default: {DEFAULT_MAX_CONCURRENT_PARTITIONS}). Total in-flight "
+            f"backups = --max-concurrent * --max-concurrent-partitions."
+        ),
     )
     parser.add_argument(
         "--timeout", type=int, default=DEFAULT_TIMEOUT,

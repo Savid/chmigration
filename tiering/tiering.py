@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Move old partitions to S3 storage, per-node (no DDL queue).
+"""Move partitions between disks, per-node (no DDL queue).
 
 Discovers partitions from system.parts on each cluster node and moves those
-older than current_month - 1 to the s3_cache disk. Partitions already on
-s3_cache or currently being moved are skipped, making this safe to re-run.
+whose parts aren't yet on the target disk. Partitions already on the target
+disk or currently being moved are skipped, making this safe to re-run.
+
+Direction is controlled by --disk: use 's3_cache' to tier down old data to
+object storage, or 'default' to restore partitions back to the local disk.
 
 Usage:
-    # Dry run — show what would be moved
+    # Dry run — show what would be moved (to s3_cache by default)
     python tiering/tiering.py \
       --host clickhouse-raw.example.com --secure \
       --user admin --password secret \
@@ -14,12 +17,20 @@ Usage:
       --table beacon_api_eth_v1_events_block \
       --dry-run
 
-    # Move partitions for specific tables
+    # Tier down to s3_cache (default --disk)
     python tiering/tiering.py \
       --host clickhouse-raw.example.com --secure \
       --user admin --password secret \
       --database default \
       --table beacon_api_eth_v1_events_block canonical_beacon_block
+
+    # Restore FROM s3_cache back to 'default' disk (all partitions)
+    python tiering/tiering.py \
+      --host clickhouse-raw.example.com --secure \
+      --user admin --password secret \
+      --database default \
+      --table beacon_api_eth_v1_events_block \
+      --disk default --all-partitions
 
     # Custom cutoff date
     python tiering/tiering.py \
@@ -1036,7 +1047,9 @@ def compute_cutoff(before: str | None) -> datetime:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Move old partitions to S3 storage, per-node (no DDL queue)",
+        description="Move partitions between disks, per-node (no DDL queue). "
+                    "Use --disk to choose the target disk (s3_cache tier-down or "
+                    "default restore).",
     )
     parser.add_argument("--host", default="localhost",
                         help="ClickHouse HTTP host (supports %%s/%%r pattern for shard/replica)")

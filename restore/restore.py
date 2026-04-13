@@ -45,6 +45,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -68,6 +69,7 @@ DEFAULT_DISK = "s3_backup"
 DEFAULT_CLUSTER = "replicated"
 DEFAULT_TIMEOUT = 3600
 DEFAULT_MAX_CONCURRENT = 5
+DEFAULT_MAX_CONCURRENT_PARTITIONS = 1
 SCRIPT_DIR = Path(__file__).resolve().parent
 STATE_LOG = SCRIPT_DIR / "state.jsonl"
 
@@ -368,11 +370,21 @@ def restore_table(
     source_cluster: str | None,
     user: str | None = None,
     password: str | None = None,
+    force_partitions: set[str] | None = None,
+    max_concurrent_partitions: int = 1,
     log: Callable[[str], None] = print,
     on_partition_done: Callable[[], None] | None = None,
     on_bytes_restored: Callable[[int], None] | None = None,
 ) -> dict:
     """Restore all backed-up partitions of a single table.
+
+    Partitions run concurrently up to *max_concurrent_partitions*; setting it
+    to 1 preserves the original sequential behavior.
+
+    When *force_partitions* is non-empty, the run is restricted to those
+    partition IDs and the RESTORED idempotency check is bypassed. Callers
+    must ALTER TABLE ... DROP PARTITION on the target first, or the fresh
+    restore will mix with existing rows.
 
     Returns a results dict with keys: database, table, source_table, restored,
     skipped, failed, partition_detail.
@@ -384,9 +396,16 @@ def restore_table(
         log(f"  {source_database}.{source_table} -> {local_db}.{local_table}")
 
     backups = discover_backups(source_host, source_port, local_db, local_table, source_cluster)
+    if force_partitions:
+        backups = [bk for bk in backups if bk["partition_id"] in force_partitions]
+        found = {bk["partition_id"] for bk in backups}
+        missing = sorted(force_partitions - found)
+        if missing:
+            log(f"  WARNING: force-partition not found in source backup_log: {missing}")
 
     results = {"restored": 0, "skipped": 0, "failed": 0}
     partition_outcomes: dict[str, str] = {}
+    results_lock = threading.Lock()
 
     if not backups:
         return {
@@ -397,51 +416,64 @@ def restore_table(
             "partition_detail": [],
         }
 
-    for bk in backups:
+    def handle_partition(bk: dict) -> None:
         if _shutdown:
-            break
+            return
 
         partition_id = bk["partition_id"]
         backup_path = bk["path"]
 
-        # Idempotency check on target.
+        force = bool(force_partitions) and partition_id in force_partitions
         status, info = check_restore_status(host, port, backup_path, cluster, user, password)
 
         if status == "RESTORED":
-            results["skipped"] += 1
-            partition_outcomes[partition_id] = "skipped"
-            if on_partition_done:
-                on_partition_done()
-            continue
+            if force:
+                # Bypass the skip; fall through to issue a new RESTORE.
+                # Caller is expected to have dropped the target partition.
+                log(f"  {partition_id} force re-restore (ignoring previous RESTORED)")
+                status, info = None, None
+            else:
+                log(f"  {partition_id} already restored — skipping")
+                with results_lock:
+                    results["skipped"] += 1
+                    partition_outcomes[partition_id] = "skipped"
+                if on_partition_done:
+                    on_partition_done()
+                return
 
         if status == "RESTORING":
-            log(f"  Waiting for in-progress restore of {partition_id}...")
+            # Always wait, even under force — issuing a concurrent RESTORE to
+            # the same path would collide.
+            log(f"  {partition_id} waiting for in-progress restore...")
             while not _shutdown:
                 time.sleep(POLL_INTERVAL)
                 status, info = check_restore_status(host, port, backup_path, cluster, user, password)
                 if status != "RESTORING":
                     break
             if _shutdown:
-                break
+                return
             if status == "RESTORED":
                 restored_bytes = int(info.get("total_size", 0)) if info else 0
                 log(f"  {partition_id} completed -> {format_size(restored_bytes)}")
-                results["restored"] += 1
-                partition_outcomes[partition_id] = "restored"
+                with results_lock:
+                    results["restored"] += 1
+                    partition_outcomes[partition_id] = "restored"
                 if on_bytes_restored:
                     on_bytes_restored(restored_bytes)
             else:
                 err = truncate_error(info.get("error", "unknown")) if info else "unknown"
                 log(f"  {partition_id} FAILED after wait: {err}")
-                results["failed"] += 1
-                partition_outcomes[partition_id] = "failed"
+                with results_lock:
+                    results["failed"] += 1
+                    partition_outcomes[partition_id] = "failed"
             if on_partition_done:
                 on_partition_done()
-            continue
+            return
 
         if status == "RESTORE_FAILED":
-            log(f"  Retrying failed partition {partition_id}")
+            log(f"  {partition_id} retrying after previous failure")
 
+        log(f"  {partition_id} issuing RESTORE...")
         # Run async restore + poll.
         try:
             rs_status, rs_info = do_restore_partition(
@@ -451,25 +483,34 @@ def restore_table(
             )
             if rs_status == "RESTORED":
                 restored_bytes = int(rs_info.get("total_size", 0)) if rs_info else 0
-                log(f"  {partition_id} -> {format_size(restored_bytes)}")
-                results["restored"] += 1
-                partition_outcomes[partition_id] = "restored"
+                log(f"  {partition_id} restored -> {format_size(restored_bytes)}")
+                with results_lock:
+                    results["restored"] += 1
+                    partition_outcomes[partition_id] = "restored"
                 if on_bytes_restored:
                     on_bytes_restored(restored_bytes)
             elif rs_status == "INTERRUPTED":
-                break
+                return
             else:
                 err = truncate_error(rs_info.get("error", "unknown")) if rs_info else "unknown"
                 log(f"  {partition_id} FAILED: {err}")
-                results["failed"] += 1
-                partition_outcomes[partition_id] = "failed"
+                with results_lock:
+                    results["failed"] += 1
+                    partition_outcomes[partition_id] = "failed"
         except ClickHouseError as e:
             log(f"  {partition_id} ERROR: {e}")
-            results["failed"] += 1
-            partition_outcomes[partition_id] = "failed"
+            with results_lock:
+                results["failed"] += 1
+                partition_outcomes[partition_id] = "failed"
 
         if on_partition_done:
             on_partition_done()
+
+    workers = max(1, max_concurrent_partitions)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(handle_partition, bk) for bk in backups]
+        for f in as_completed(futures):
+            f.result()
 
     return {
         "database": local_db,
@@ -671,11 +712,51 @@ def run_single_table(args, cluster: str | None, source_cluster: str | None) -> N
         print(f"Local table: {local_db}.{local_table}")
 
     backups = discover_backups(args.source_host, args.source_port, local_db, local_table, source_cluster)
+    force_partitions: set[str] = set(args.force_partition) if args.force_partition else set()
+    if force_partitions:
+        backups = [bk for bk in backups if bk["partition_id"] in force_partitions]
+        found = {bk["partition_id"] for bk in backups}
+        missing = sorted(force_partitions - found)
+        if missing:
+            print(f"WARNING: force-partition not found in source backup_log: {missing}")
     if not backups:
         print("No backups found for this table")
         return
 
     print(f"Found {len(backups)} backed-up partition(s)")
+    if force_partitions:
+        print(f"Force re-restore mode: {sorted(force_partitions)} (RESTORED check bypassed)")
+
+    # Concurrent path: delegate to restore_table (no per-partition polling dots,
+    # but partitions run in parallel up to --max-concurrent-partitions).
+    if args.max_concurrent_partitions > 1 or force_partitions:
+        print(f"Restoring up to {args.max_concurrent_partitions} partitions concurrently\n")
+        result = restore_table(
+            host=args.host,
+            port=args.port,
+            source_host=args.source_host,
+            source_port=args.source_port,
+            source_database=args.database,
+            source_table=table,
+            disk=args.disk,
+            cluster=cluster,
+            source_cluster=source_cluster,
+            user=args.user,
+            password=args.password,
+            force_partitions=force_partitions or None,
+            max_concurrent_partitions=args.max_concurrent_partitions,
+        )
+        total = result["restored"] + result["skipped"] + result["failed"]
+        print(f"\n{'=' * 60}")
+        print(f"Restore complete: {local_db}.{local_table}")
+        print(f"  Restored:     {result['restored']:>4} / {total}")
+        print(f"  Skipped:      {result['skipped']:>4} (already restored)")
+        print(f"  Failed:       {result['failed']:>4}")
+        write_state_log(result, args.host, cluster, args.disk)
+        print(f"  State log:    {STATE_LOG}")
+        if result["failed"] > 0:
+            sys.exit(1)
+        return
 
     results = {"restored": 0, "skipped": 0, "failed": 0}
     partition_outcomes: dict[str, str] = {}
@@ -916,6 +997,8 @@ def run_multi_table(args, cluster: str | None, source_cluster: str | None) -> No
                 source_cluster=source_cluster,
                 user=args.user,
                 password=args.password,
+                force_partitions=set(args.force_partition) if args.force_partition else None,
+                max_concurrent_partitions=args.max_concurrent_partitions,
                 log=log,
                 on_partition_done=on_partition_done,
                 on_bytes_restored=on_bytes_restored,
@@ -1003,6 +1086,27 @@ def main() -> None:
     parser.add_argument(
         "--max-concurrent", type=int, default=DEFAULT_MAX_CONCURRENT,
         help=f"Max tables to restore concurrently (default: {DEFAULT_MAX_CONCURRENT})",
+    )
+    parser.add_argument(
+        "--max-concurrent-partitions", type=int, default=DEFAULT_MAX_CONCURRENT_PARTITIONS,
+        help=(
+            f"Max partitions to restore concurrently per table "
+            f"(default: {DEFAULT_MAX_CONCURRENT_PARTITIONS}). Total in-flight "
+            f"restores = --max-concurrent * --max-concurrent-partitions."
+        ),
+    )
+    parser.add_argument(
+        "--force-partition",
+        nargs="+",
+        metavar="PARTITION_ID",
+        help=(
+            "Force re-restore of specific partition IDs (e.g. 20260201). "
+            "Filters to just these partitions and bypasses the RESTORED "
+            "idempotency check (including stale in-memory rows in "
+            "system.backups). IMPORTANT: ALTER TABLE ... DROP PARTITION ID "
+            "on the target first, or the fresh restore will mix with "
+            "existing rows."
+        ),
     )
     parser.add_argument(
         "--timeout", type=int, default=DEFAULT_TIMEOUT,

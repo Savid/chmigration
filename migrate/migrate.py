@@ -198,30 +198,24 @@ def check_partition_status(
     if running:
         return "running"
 
-    # Check query_log across ALL nodes. If ANY node has an exception for this
-    # query_id, the migration is not complete — even if other nodes succeeded
-    # their sub-queries.
-    has_failure = query_json_rows(
+    # Consider the most recent event across all replicas. If the latest is a
+    # clean QueryFinish, treat as completed — even if an earlier run left
+    # ExceptionWhileProcessing rows. Stale exceptions would otherwise force
+    # wasteful re-runs of partitions that eventually succeeded.
+    latest = query_json_rows(
         host, port,
-        f"SELECT query_id FROM clusterAllReplicas('{cluster}', system.query_log) "
-        f"WHERE query_id = '{query_id}' AND type = 'ExceptionWhileProcessing' "
-        f"LIMIT 1",
+        f"SELECT type, exception_code "
+        f"FROM clusterAllReplicas('{cluster}', system.query_log) "
+        f"WHERE query_id = '{query_id}' AND type IN ('QueryFinish', 'ExceptionWhileProcessing') "
+        f"ORDER BY event_time DESC LIMIT 1",
         timeout=10, user=user, password=password,
     )
-    if has_failure:
+    if not latest:
         return "none"
 
-    # Only mark completed if at least one node has QueryFinish with no errors.
-    finished = query_json_rows(
-        host, port,
-        f"SELECT query_id FROM clusterAllReplicas('{cluster}', system.query_log) "
-        f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' AND exception_code = 0 "
-        f"LIMIT 1",
-        timeout=10, user=user, password=password,
-    )
-    if finished:
+    row = latest[0]
+    if row.get("type") == "QueryFinish" and int(row.get("exception_code", 0)) == 0:
         return "completed"
-
     return "none"
 
 
@@ -418,8 +412,15 @@ def _migrate_one_partition(
     log: Callable[[str], None],
     on_partition_done: Callable[[], None] | None,
     on_partition_status: Callable[[str, str, str], None] | None,
+    force: bool = False,
 ) -> dict:
-    """Migrate a single partition. Returns a detail dict."""
+    """Migrate a single partition. Returns a detail dict.
+
+    When *force* is True, the "already completed" checks (local state.jsonl
+    and system.query_log) are bypassed so the INSERT re-runs even if a
+    previous attempt succeeded. A genuinely in-flight query is still waited
+    on — issuing a concurrent INSERT with the same query_id would collide.
+    """
     qid = make_query_id(database, dist_table, partition_id)
 
     if dry_run:
@@ -433,7 +434,7 @@ def _migrate_one_partition(
         return {"partition_id": partition_id, "outcome": "dry_run", "rows": row_count}
 
     # --- Resume: check local state first, then ClickHouse ---
-    if qid in completed_qids:
+    if not force and qid in completed_qids:
         log(f"  {partition_id}  SKIP   already completed (local)")
         if on_partition_status:
             on_partition_status(partition_id, qid, "completed")
@@ -443,7 +444,7 @@ def _migrate_one_partition(
 
     status = check_partition_status(raw_host, raw_port, qid, raw_cluster, raw_user, raw_password)
 
-    if status == "completed":
+    if status == "completed" and not force:
         log(f"  {partition_id}  SKIP   already completed (query_log)")
         write_partition_state(database, dist_table, partition_id, qid, "ok")
         if on_partition_status:
@@ -451,6 +452,9 @@ def _migrate_one_partition(
         if on_partition_done:
             on_partition_done()
         return {"partition_id": partition_id, "outcome": "skipped", "query_id": qid}
+
+    if status == "completed" and force:
+        log(f"  {partition_id}  FORCE  re-running (ignoring previous QueryFinish)")
 
     if status == "running":
         log(f"  {partition_id}  WAIT   already running ({qid})")
@@ -519,6 +523,7 @@ def migrate_table(
     dry_run: bool = False,
     partition_filter: list[str] | None = None,
     max_concurrent_partitions: int = 1,
+    force: bool = False,
     log: Callable[[str], None] = print,
     on_partition_done: Callable[[], None] | None = None,
     on_partition_status: Callable[[str, str, str], None] | None = None,
@@ -589,6 +594,7 @@ def migrate_table(
                 make_insert_sql(partition_id), retries, dry_run,
                 refined_cluster, raw_cluster, local_table, completed_qids,
                 log, on_partition_done, on_partition_status,
+                force=force,
             )
             details.append(detail)
             results[detail["outcome"]] = results.get(detail["outcome"], 0) + 1
@@ -604,6 +610,7 @@ def migrate_table(
                 make_insert_sql(partition_id), retries, dry_run,
                 refined_cluster, raw_cluster, local_table, completed_qids,
                 log, on_partition_done, on_partition_status,
+                force=force,
             )
 
         with ThreadPoolExecutor(max_workers=max_concurrent_partitions) as pool:
@@ -716,6 +723,7 @@ def run_single_table(args, table_def: dict) -> None:
         dry_run=args.dry_run,
         partition_filter=partition_filter,
         max_concurrent_partitions=args.max_concurrent_partitions,
+        force=args.force,
     )
 
     total = sum(result[k] for k in ("ok", "skipped", "error"))
@@ -823,6 +831,7 @@ def run_multi_table(args, table_defs: list[dict]) -> None:
                 retries=args.retries,
                 dry_run=args.dry_run,
                 max_concurrent_partitions=args.max_concurrent_partitions,
+                force=args.force,
                 log=log,
                 on_partition_done=on_partition_done,
             )
@@ -907,6 +916,15 @@ def main() -> None:
     parser.add_argument("--max-concurrent-partitions", type=int, default=DEFAULT_MAX_CONCURRENT_PARTITIONS, help="Max concurrent partitions per table (default: 3)")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="INSERT query timeout in seconds")
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Retry failed partitions N times")
+    parser.add_argument(
+        "--force", action="store_true",
+        help=(
+            "Re-run migration even if partitions are already marked completed. "
+            "Bypasses both the local state.jsonl check and the "
+            "system.query_log check. A genuinely in-flight query is still "
+            "waited on. Combine with --partition to target specific IDs."
+        ),
+    )
 
     args = parser.parse_args()
 
