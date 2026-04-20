@@ -66,6 +66,15 @@ STATE_LOG = SCRIPT_DIR / "state.jsonl"
 # ClickHouse HTTP helpers
 # ---------------------------------------------------------------------------
 
+class OptimizeStalled(Exception):
+    """OPTIMIZE FINAL never scheduled a merge for this partition.
+
+    Terminal: re-firing the same OPTIMIZE will not help (likely contention
+    on Keeper coordination or merge selection blocked by other workload).
+    The caller should skip rather than retry.
+    """
+
+
 class ClickHouseError(Exception):
     def __init__(self, message: str, status: int = 0):
         super().__init__(message)
@@ -510,7 +519,6 @@ def poll_optimize_done(
     database: str,
     table: str,
     partition_id: str,
-    initial_parts: int,
     cluster: str | None = None,
     user: str | None = None,
     password: str | None = None,
@@ -518,53 +526,59 @@ def poll_optimize_done(
     on_merge_progress: Callable[[str, list[dict] | None], None] | None = None,
     num_nodes: int = 1,
 ) -> int:
-    """Poll system.parts until the partition's part count drops (merge landed).
+    """Poll system.parts until the partition fully converges.
 
-    Calls on_merge_progress(partition_id, nodes) each cycle where nodes is the
-    per-host merge list or None when no merge is active.
+    Convergence = active part count <= num_nodes (1 part per replica) and no
+    merge running for this partition.  Calls on_merge_progress(partition_id,
+    nodes) each cycle where nodes is the per-host merge list or None when no
+    merge is active.
 
-    When *num_nodes* > 1 (cluster with clusterAllReplicas monitoring), the
-    minimum possible part count is num_nodes (1 per replica).  If the count
-    is already at that minimum and no merge is active, returns immediately.
-
-    Returns the final part count.  Raises TimeoutError if timeout is exceeded.
+    Raises OptimizeStalled if NO merges have ever been observed and the part
+    count never dropped below the initial reading after several poll cycles
+    (OPTIMIZE was a true no-op — re-firing won't help).
+    Raises TimeoutError if timeout is exceeded while merges are still in flight.
     """
     deadline = time.monotonic() + timeout
     no_merge_cycles = 0
+    initial_count: int | None = None
+    progress_made = False
     while not _shutdown:
         time.sleep(POLL_INTERVAL)
         current = get_partition_part_count(
             host, port, database, table, partition_id, cluster, user, password,
         )
-        if current < initial_parts:
-            if on_merge_progress:
-                on_merge_progress(partition_id, None)
-            return current
+        if initial_count is None:
+            initial_count = current
+        elif current < initial_count:
+            progress_made = True
 
         merge_nodes = get_merge_progress(
             host, port, database, table, partition_id, cluster, user, password,
         )
+        if merge_nodes:
+            progress_made = True
 
-        # Already at minimum (1 part per replica) and no merge running — done.
+        # Converged: at minimum (1 part per replica) and no merge running.
         if current <= num_nodes and not merge_nodes:
             if on_merge_progress:
                 on_merge_progress(partition_id, None)
             return current
 
-        # No merge running and count hasn't dropped — OPTIMIZE was a no-op.
+        # No merge running for several cycles. Only declare stalled if we've
+        # never observed any progress (no merge ever ran AND part count never
+        # dropped). Otherwise keep waiting — a quiet window between merge
+        # waves is normal, especially when the background pool is busy.
         if not merge_nodes:
             no_merge_cycles += 1
-            if no_merge_cycles >= 3:
+            if no_merge_cycles >= 3 and not progress_made:
                 if on_merge_progress:
                     on_merge_progress(partition_id, None)
-                if current > num_nodes:
-                    raise ClickHouseError(
-                        f"OPTIMIZE had no effect on partition {partition_id}: "
-                        f"still {current} parts (expected {num_nodes}). "
-                        f"Merge may be blocked by low dynamic merge size limit "
-                        f"(check background pool usage)."
-                    )
-                return current
+                raise OptimizeStalled(
+                    f"OPTIMIZE FINAL on {partition_id} did not schedule any "
+                    f"merge and part count never dropped below {initial_count} "
+                    f"(target {num_nodes}); merges may be gated by background "
+                    f"pool capacity or Keeper coordination contention."
+                )
         else:
             no_merge_cycles = 0
 
@@ -623,7 +637,7 @@ def optimize_table(
 
     all_parts = get_partitions(host, port, local_db, local_table, cutoff, cluster, user, password)
 
-    results = {"optimized": 0, "skipped": 0, "failed": 0}
+    results = {"optimized": 0, "skipped": 0, "stalled": 0, "failed": 0}
     details: list[dict] = []
     results_lock = threading.Lock()
 
@@ -677,7 +691,7 @@ def optimize_table(
                 )
                 new_count = poll_optimize_done(
                     host, port, local_db, local_table,
-                    partition_id, part_count, cluster, user, password, timeout,
+                    partition_id, cluster, user, password, timeout,
                     on_merge_progress=on_merge_progress,
                     num_nodes=len(nodes) if nodes else 1,
                 )
@@ -689,6 +703,21 @@ def optimize_table(
                         "outcome": "optimized",
                         "part_count_before": part_count,
                         "part_count_after": new_count,
+                        "rows": total_rows,
+                        "bytes": bytes_on_disk,
+                    })
+                break
+
+            except OptimizeStalled as e:
+                err = truncate_error(str(e))
+                log(f"  {partition_id}  STALL  {err}")
+                with results_lock:
+                    results["stalled"] += 1
+                    details.append({
+                        "partition_id": partition_id,
+                        "outcome": "stalled",
+                        "reason": err,
+                        "part_count": part_count,
                         "rows": total_rows,
                         "bytes": bytes_on_disk,
                     })
@@ -871,11 +900,12 @@ def run_single_table(args, cluster: str | None, cutoff: datetime | None, nodes: 
         max_partition_concurrent=args.partitions_concurrent,
     )
 
-    total = sum(result[k] for k in ("optimized", "skipped", "failed"))
+    total = sum(result[k] for k in ("optimized", "skipped", "stalled", "failed"))
     print(f"\n{'=' * 60}")
     print(f"Optimize complete: {local_db}.{local_table}")
     print(f"  Optimized:  {result['optimized']:>4} / {total}")
     print(f"  Skipped:    {result['skipped']:>4} (already merged)")
+    print(f"  Stalled:    {result['stalled']:>4} (OPTIMIZE no-op, not retried)")
     print(f"  Failed:     {result['failed']:>4}")
 
     write_state_log(result, args.host)
@@ -1065,8 +1095,11 @@ def run_multi_table(args, cluster: str | None, cutoff: datetime | None, nodes: l
 
             o = result["optimized"]
             s = result["skipped"]
+            st = result["stalled"]
             f = result["failed"]
             status = f"done: {o} opt, {s} skip"
+            if st > 0:
+                status += f", [yellow]{st} stall[/yellow]"
             if f > 0:
                 status += f", [red]{f} fail[/red]"
             progress.update(
@@ -1095,19 +1128,19 @@ def run_multi_table(args, cluster: str | None, cutoff: datetime | None, nodes: l
                     has_failures = True
 
     # Final summary.
-    print(f"\n{'=' * 70}")
-    print(f"{'Table':<50} {'Opt':>5} {'Skip':>5} {'Fail':>5}")
-    print(f"{'-' * 70}")
-    totals = {"optimized": 0, "skipped": 0, "failed": 0}
+    print(f"\n{'=' * 78}")
+    print(f"{'Table':<50} {'Opt':>5} {'Skip':>5} {'Stall':>5} {'Fail':>5}")
+    print(f"{'-' * 78}")
+    totals = {"optimized": 0, "skipped": 0, "stalled": 0, "failed": 0}
     for r in sorted(all_results, key=lambda x: x["table"]):
         name = f"{r['database']}.{r['table']}"
         if len(name) > 48:
             name = name[:47] + "…"
-        print(f"  {name:<48} {r['optimized']:>5} {r['skipped']:>5} {r['failed']:>5}")
+        print(f"  {name:<48} {r['optimized']:>5} {r['skipped']:>5} {r['stalled']:>5} {r['failed']:>5}")
         for k in totals:
             totals[k] += r[k]
-    print(f"{'-' * 70}")
-    print(f"  {'TOTAL':<48} {totals['optimized']:>5} {totals['skipped']:>5} {totals['failed']:>5}")
+    print(f"{'-' * 78}")
+    print(f"  {'TOTAL':<48} {totals['optimized']:>5} {totals['skipped']:>5} {totals['stalled']:>5} {totals['failed']:>5}")
     print(f"\nState log: {STATE_LOG}")
 
     if has_failures:
